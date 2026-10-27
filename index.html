@@ -163,7 +163,7 @@
   <dialog id="encodingSettingsDialog" aria-labelledby="encodingSettingsTitle" aria-describedby="encodingSettingsDescription">
     <form id="encodingSettingsForm">
       <h2 id="encodingSettingsTitle">Lautstärkeprofil</h2>
-      <p id="encodingSettingsDescription">Wähle, wie laut die konvertierten Clips wiedergegeben werden sollen. Vorhandene .opus-Dateien bleiben unverändert.</p>
+      <p id="encodingSettingsDescription">Wähle, wie laut die konvertierten Clips wiedergegeben werden sollen. Tiefe Töne unter 150 Hz werden für den kleinen Lautsprecher reduziert; vorhandene .opus-Dateien bleiben unverändert.</p>
       <div class="settings-fields preset-fields">
         <label for="settingPreset">Wiedergabe-Lautstärke
           <select id="settingPreset">
@@ -461,6 +461,7 @@
       const filters = [
         "aresample=" + settings.sampleRate,
         "aformat=channel_layouts=" + (settings.channels === 1 ? "mono" : "stereo"),
+        "highpass=f=150:p=2",
         "acompressor=threshold=0.126:ratio=" + settings.compressionRatio + ":attack=10:release=150:makeup=1",
         "loudnorm=I=" + targetLoudness + ":TP=" + truePeak + ":LRA=" + settings.lra
       ];
