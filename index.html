@@ -457,7 +457,9 @@
       } catch (error) {
         try { ffmpeg.terminate(); } catch (_) {}
         ffmpegPromise = null;
-        throw new Error(errorText(error));
+        const failure = new Error(errorText(error));
+        failure.name = "FFmpegWorkerError";
+        throw failure;
       }
       if (exitCode !== 0) throw new Error("Die Audiodatei konnte nicht verarbeitet werden. Bitte ein unterstütztes Audioformat wählen.");
     }
@@ -527,7 +529,7 @@
       return (name.replace(/\.[^.]*$/, "") || "audio") + ".opus";
     }
 
-    async function convertAudioToOpus(file, outputName, settings) {
+    async function convertAudioToOpus(file, outputName, settings, retriedWorkerError) {
       const ffmpeg = await loadFfmpeg();
       let inputStats;
       const encode = async function (targetLoudness, truePeak) {
@@ -589,7 +591,12 @@
         if (!(error instanceof Error)) {
           try { ffmpeg.terminate(); } catch (_) {}
           ffmpegPromise = null;
-          throw new Error(errorText(error));
+          error = new Error(errorText(error));
+          error.name = "FFmpegWorkerError";
+        }
+        if (error.name === "FFmpegWorkerError" && !retriedWorkerError) {
+          showNotice(file.name + " wird nach einem Encoder-Fehler erneut verarbeitet …");
+          return convertAudioToOpus(file, outputName, settings, true);
         }
         throw error;
       } finally {
