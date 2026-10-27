@@ -87,10 +87,9 @@
     dialog h2 { margin: 0 0 8px; font-size: 1.25rem; }
     dialog p { margin: 0 0 16px; }
     .settings-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+    .settings-fields.preset-fields { grid-template-columns: 1fr; }
     .settings-fields label { display: grid; align-content: start; gap: 5px; color: #344252; font-size: .9rem; }
     .settings-fields input, .settings-fields select { width: 100%; min-height: 40px; border: 1px solid #c7d0da; border-radius: 7px; padding: 8px; color: inherit; font: inherit; }
-    .settings-fields .checkbox-setting { display: flex; align-items: center; min-height: 40px; gap: 8px; }
-    .settings-fields .checkbox-setting input { width: 18px; min-height: auto; height: 18px; }
     .settings-note { margin: 14px 0 !important; font-size: .88rem; }
     .settings-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
     @media (max-width: 560px) {
@@ -163,21 +162,19 @@
 
   <dialog id="encodingSettingsDialog" aria-labelledby="encodingSettingsTitle" aria-describedby="encodingSettingsDescription">
     <form id="encodingSettingsForm">
-      <h2 id="encodingSettingsTitle">Konvertierungseinstellungen</h2>
-      <p id="encodingSettingsDescription">Diese Werte gelten für Audiodateien ausser .opus. Die Standardwerte sind auf die ESP32-Wiedergabe abgestimmt.</p>
-      <div class="settings-fields">
-        <label>Integrierte Lautheit (LUFS)<input id="settingLoudness" type="number" min="-70" max="-5" step="0.1" required></label>
-        <label>True-Peak-Ziel, erster Durchlauf (dBTP)<input id="settingFirstPeak" type="number" min="-9" max="0" step="0.1" required></label>
-        <label>Loudness Range (LU)<input id="settingLra" type="number" min="1" max="50" step="0.1" required></label>
-        <label>Maximaler True Peak der fertigen Datei (dBTP)<input id="settingPeakLimit" type="number" min="-9" max="0" step="0.1" required></label>
-        <label>True-Peak-Ziel beim erneuten Enkodieren (dBTP)<input id="settingRetryPeak" type="number" min="-9" max="0" step="0.1" required></label>
-        <label>Samplerate<select id="settingSampleRate"><option value="8000">8.000 Hz</option><option value="12000">12.000 Hz</option><option value="16000">16.000 Hz</option><option value="24000">24.000 Hz</option><option value="48000">48.000 Hz</option></select></label>
-        <label>Kanäle<select id="settingChannels"><option value="1">Mono</option><option value="2">Stereo</option></select></label>
-        <label>Opus-Anwendung<select id="settingApplication"><option value="voip">Sprachübertragung (voip)</option><option value="audio">Musik (audio)</option><option value="lowdelay">Geringe Latenz (lowdelay)</option></select></label>
-        <label>Bitrate (kbit/s)<input id="settingBitrate" type="number" min="6" max="256" step="1" required></label>
-        <label class="checkbox-setting"><input id="settingVbr" type="checkbox"> Variable Bitrate (VBR)</label>
+      <h2 id="encodingSettingsTitle">Lautstärkeprofil</h2>
+      <p id="encodingSettingsDescription">Wähle, wie laut die konvertierten Clips wiedergegeben werden sollen. Vorhandene .opus-Dateien bleiben unverändert.</p>
+      <div class="settings-fields preset-fields">
+        <label for="settingPreset">Wiedergabe-Lautstärke
+          <select id="settingPreset">
+            <option value="quiet">Leise</option>
+            <option value="normal">Normal (empfohlen)</option>
+            <option value="loud">Laut</option>
+          </select>
+        </label>
       </div>
-      <p class="settings-note">48 kHz und Mono sind voreingestellt. Kompression und Downmix erfolgen vor der Lautheitsmessung. Nach dem Opus-Encoding wird geprüft; bei verfehltem LUFS-Ziel oder True-Peak-Limit wird nicht übertragen. Einstellungen werden auf diesem ESP32 gespeichert.</p>
+      <p id="presetDescription" class="settings-note" aria-live="polite">Ausgewogene Lautstärke für die meisten Clips.</p>
+      <p class="settings-note">Konvertierte Dateien werden auf Übersteuerung geprüft; unsichere Dateien werden nicht übertragen. Die Auswahl wird auf diesem ESP32 gespeichert.</p>
       <div class="settings-actions">
         <button id="cancelSettingsButton" class="secondary" type="button">Abbrechen</button>
         <button type="submit">Speichern</button>
@@ -193,7 +190,11 @@
     const FFMPEG_CDN = "https://cdn.jsdelivr.net/npm";
     const LOUDNESS_TOLERANCE = 0.5;
     const MAX_LOUDNESS_CORRECTIONS = 3;
-    const PRE_OPUS_COMPRESSOR = "acompressor=threshold=0.126:ratio=3:attack=10:release=150:makeup=1";
+    const ENCODING_PRESETS = Object.freeze({
+      quiet: Object.freeze({ label: "Leise", loudness: -20, compressionRatio: 2, description: "Leiser und zurückhaltender." }),
+      normal: Object.freeze({ label: "Normal", loudness: -16, compressionRatio: 3, description: "Ausgewogene Lautstärke für die meisten Clips." }),
+      loud: Object.freeze({ label: "Laut", loudness: -14, compressionRatio: 4, description: "Lauter und stärker komprimiert." })
+    });
     const DEFAULT_ENCODING_SETTINGS = Object.freeze({
       loudness: -16,
       firstPeak: -2,
@@ -290,32 +291,38 @@
         typeof settings.vbr === "boolean";
     }
 
+    function settingsForPreset(preset) {
+      const selected = ENCODING_PRESETS[preset] ? preset : "normal";
+      return Object.assign({}, DEFAULT_ENCODING_SETTINGS, {
+        loudness: ENCODING_PRESETS[selected].loudness,
+        compressionRatio: ENCODING_PRESETS[selected].compressionRatio,
+        preset: selected
+      });
+    }
+
+    function presetForSettings(settings) {
+      return Object.keys(ENCODING_PRESETS).reduce(function (closest, preset) {
+        return Math.abs(ENCODING_PRESETS[preset].loudness - settings.loudness) < Math.abs(ENCODING_PRESETS[closest].loudness - settings.loudness) ? preset : closest;
+      }, "quiet");
+    }
+
+    function settingsFromDeviceSettings(settings) {
+      return settingsForPreset(presetForSettings(settings));
+    }
+
+    function deviceSettingsMatchPreset(settings, preset) {
+      const expected = settingsForPreset(preset);
+      return Object.keys(DEFAULT_ENCODING_SETTINGS).every(function (key) { return settings[key] === expected[key]; });
+    }
+
     function populateSettingsForm(settings) {
-      document.getElementById("settingLoudness").value = settings.loudness;
-      document.getElementById("settingFirstPeak").value = settings.firstPeak;
-      document.getElementById("settingLra").value = settings.lra;
-      document.getElementById("settingPeakLimit").value = settings.peakLimit;
-      document.getElementById("settingRetryPeak").value = settings.retryPeak;
-      document.getElementById("settingSampleRate").value = settings.sampleRate;
-      document.getElementById("settingChannels").value = settings.channels;
-      document.getElementById("settingApplication").value = settings.application;
-      document.getElementById("settingBitrate").value = settings.bitrate;
-      document.getElementById("settingVbr").checked = settings.vbr;
+      const preset = settings.preset || presetForSettings(settings);
+      document.getElementById("settingPreset").value = preset;
+      document.getElementById("presetDescription").textContent = ENCODING_PRESETS[preset].description;
     }
 
     function readSettingsForm() {
-      return {
-        loudness: Number(document.getElementById("settingLoudness").value),
-        firstPeak: Number(document.getElementById("settingFirstPeak").value),
-        lra: Number(document.getElementById("settingLra").value),
-        peakLimit: Number(document.getElementById("settingPeakLimit").value),
-        retryPeak: Number(document.getElementById("settingRetryPeak").value),
-        sampleRate: Number(document.getElementById("settingSampleRate").value),
-        channels: Number(document.getElementById("settingChannels").value),
-        application: document.getElementById("settingApplication").value,
-        bitrate: Number(document.getElementById("settingBitrate").value),
-        vbr: document.getElementById("settingVbr").checked
-      };
+      return settingsForPreset(document.getElementById("settingPreset").value);
     }
 
     function updateSelectionControls() {
@@ -454,7 +461,7 @@
       const filters = [
         "aresample=" + settings.sampleRate,
         "aformat=channel_layouts=" + (settings.channels === 1 ? "mono" : "stereo"),
-        PRE_OPUS_COMPRESSOR,
+        "acompressor=threshold=0.126:ratio=" + settings.compressionRatio + ":attack=10:release=150:makeup=1",
         "loudnorm=I=" + targetLoudness + ":TP=" + truePeak + ":LRA=" + settings.lra
       ];
       if (inputStats) {
@@ -1082,9 +1089,14 @@
         showNotice("Verbunden. Dateiliste und Einstellungen werden geladen …");
         try {
           renderFiles(await listFiles());
-          encodingSettings = await readDeviceEncodingSettings();
+          const storedSettings = await readDeviceEncodingSettings();
+          encodingSettings = settingsFromDeviceSettings(storedSettings);
           encodingSettingsLoaded = true;
-          showNotice("Dateien und Encoder-Einstellungen vom ESP32 geladen.", "success");
+          const presetLabel = ENCODING_PRESETS[encodingSettings.preset].label;
+          const needsSave = !deviceSettingsMatchPreset(storedSettings, encodingSettings.preset);
+          showNotice(needsSave
+            ? "Profil „" + presetLabel + "“ ist aktiv. Im Lautstärke-Dialog speichern, damit es dauerhaft auf dem ESP32 steht."
+            : "Dateien und Profil „" + presetLabel + "“ vom ESP32 geladen.", needsSave ? "warning" : "success");
         } catch (error) {
           showNotice(error.message, "error");
         } finally {
@@ -1125,13 +1137,16 @@
     connectButton.addEventListener("click", connect);
     refreshButton.addEventListener("click", refreshFiles);
     uploadButton.addEventListener("click", uploadFile);
+    document.getElementById("settingPreset").addEventListener("change", function (event) {
+      document.getElementById("presetDescription").textContent = ENCODING_PRESETS[event.target.value].description;
+    });
     settingsButton.addEventListener("click", async function () {
       if (!port || busy) return;
       encodingSettingsLoaded = false;
       setBusy(true);
       showNotice("Einstellungen werden vom ESP32 geladen …");
       try {
-        encodingSettings = await readDeviceEncodingSettings();
+        encodingSettings = settingsFromDeviceSettings(await readDeviceEncodingSettings());
         encodingSettingsLoaded = true;
         populateSettingsForm(encodingSettings);
         settingsDialog.showModal();
@@ -1147,9 +1162,7 @@
       event.preventDefault();
       const settings = readSettingsForm();
       if (!validEncodingSettings(settings)) {
-        document.getElementById("settingRetryPeak").setCustomValidity("Das Ziel muss niedriger sein als der Spitzenpegel für den erneuten Durchlauf.");
-        settingsForm.reportValidity();
-        document.getElementById("settingRetryPeak").setCustomValidity("");
+        showNotice("Dieses Lautstärkeprofil ist ungültig.", "error");
         return;
       }
       if (!port || busy) {
