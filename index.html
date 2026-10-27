@@ -82,6 +82,17 @@
     .preview-panel h2 { margin: 0 0 6px; font-size: 1.1rem; }
     .preview-panel p { margin: 0 0 8px; overflow-wrap: anywhere; }
     .preview-panel audio { display: block; width: 100%; }
+    dialog { width: min(560px, calc(100% - 24px)); max-height: calc(100% - 24px); overflow: auto; border: 1px solid #dce3ea; border-radius: 14px; padding: 22px; color: #18212b; box-shadow: 0 16px 48px #172b3b30; }
+    dialog::backdrop { background: #172b3b80; }
+    dialog h2 { margin: 0 0 8px; font-size: 1.25rem; }
+    dialog p { margin: 0 0 16px; }
+    .settings-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+    .settings-fields label { display: grid; align-content: start; gap: 5px; color: #344252; font-size: .9rem; }
+    .settings-fields input, .settings-fields select { width: 100%; min-height: 40px; border: 1px solid #c7d0da; border-radius: 7px; padding: 8px; color: inherit; font: inherit; }
+    .settings-fields .checkbox-setting { display: flex; align-items: center; min-height: 40px; gap: 8px; }
+    .settings-fields .checkbox-setting input { width: 18px; min-height: auto; height: 18px; }
+    .settings-note { margin: 14px 0 !important; font-size: .88rem; }
+    .settings-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
     @media (max-width: 560px) {
       body { padding: 16px 10px; }
       .card { padding: 18px 14px; }
@@ -91,6 +102,7 @@
       th:nth-child(3), td:nth-child(3) { width: auto; }
       th:last-child, td:last-child { width: auto; }
       .file-actions { flex-wrap: wrap; }
+      .settings-fields { grid-template-columns: 1fr; }
     }
   </style>
 </head>
@@ -122,6 +134,7 @@
         <label class="file-picker" for="fileInput">Audiodateien auswählen</label>
         <input id="fileInput" type="file" accept="audio/*,.opus" multiple>
         <span id="fileName" class="file-name">Keine Datei ausgewählt</span>
+        <button id="settingsButton" class="secondary" type="button">Einstellungen</button>
         <button id="uploadButton" type="button" disabled>Hochladen</button>
       </div>
       <progress id="progress" max="100" value="0" hidden></progress>
@@ -148,15 +161,56 @@
     </section>
   </main>
 
+  <dialog id="encodingSettingsDialog" aria-labelledby="encodingSettingsTitle" aria-describedby="encodingSettingsDescription">
+    <form id="encodingSettingsForm">
+      <h2 id="encodingSettingsTitle">Konvertierungseinstellungen</h2>
+      <p id="encodingSettingsDescription">Diese Werte gelten für Audiodateien ausser .opus. Die Standardwerte sind auf die ESP32-Wiedergabe abgestimmt.</p>
+      <div class="settings-fields">
+        <label>Integrierte Lautheit (LUFS)<input id="settingLoudness" type="number" min="-70" max="-5" step="0.1" required></label>
+        <label>True-Peak-Ziel, erster Durchlauf (dBTP)<input id="settingFirstPeak" type="number" min="-9" max="0" step="0.1" required></label>
+        <label>Loudness Range (LU)<input id="settingLra" type="number" min="1" max="50" step="0.1" required></label>
+        <label>Erneut enkodieren ab Spitzenpegel (dBFS)<input id="settingPeakLimit" type="number" min="-9" max="0" step="0.1" required></label>
+        <label>True-Peak-Ziel beim erneuten Enkodieren (dBTP)<input id="settingRetryPeak" type="number" min="-9" max="0" step="0.1" required></label>
+        <label>Samplerate<select id="settingSampleRate"><option value="8000">8.000 Hz</option><option value="12000">12.000 Hz</option><option value="16000">16.000 Hz</option><option value="24000">24.000 Hz</option><option value="48000">48.000 Hz</option></select></label>
+        <label>Kanäle<select id="settingChannels"><option value="1">Mono</option><option value="2">Stereo</option></select></label>
+        <label>Opus-Anwendung<select id="settingApplication"><option value="voip">Sprachübertragung (voip)</option><option value="audio">Musik (audio)</option><option value="lowdelay">Geringe Latenz (lowdelay)</option></select></label>
+        <label>Bitrate (kbit/s)<input id="settingBitrate" type="number" min="6" max="256" step="1" required></label>
+        <label class="checkbox-setting"><input id="settingVbr" type="checkbox"> Variable Bitrate (VBR)</label>
+      </div>
+      <p class="settings-note">48 kHz und Mono sind für den ESP32 voreingestellt. Andere Werte können die Wiedergabe auf dem Gerät beeinflussen. Einstellungen werden in diesem Browser gespeichert.</p>
+      <div class="settings-actions">
+        <button id="cancelSettingsButton" class="secondary" type="button">Abbrechen</button>
+        <button type="submit">Speichern</button>
+      </div>
+    </form>
+  </dialog>
+
   <script>
     "use strict";
 
     const CHUNK_FALLBACK = 512;
     const FFMPEG_VERSION = "0.12.10";
     const FFMPEG_CDN = "https://cdn.jsdelivr.net/npm";
+    const ENCODING_SETTINGS_KEY = "soundManagerEncodingSettings";
+    const DEFAULT_ENCODING_SETTINGS = Object.freeze({
+      loudness: -16,
+      firstPeak: -2,
+      lra: 7,
+      peakLimit: -1,
+      retryPeak: -4,
+      sampleRate: 48000,
+      channels: 1,
+      application: "voip",
+      bitrate: 32,
+      vbr: true
+    });
     const connectButton = document.getElementById("connectButton");
     const refreshButton = document.getElementById("refreshButton");
     const uploadButton = document.getElementById("uploadButton");
+    const settingsButton = document.getElementById("settingsButton");
+    const settingsDialog = document.getElementById("encodingSettingsDialog");
+    const settingsForm = document.getElementById("encodingSettingsForm");
+    const cancelSettingsButton = document.getElementById("cancelSettingsButton");
     const fileInput = document.getElementById("fileInput");
     const fileName = document.getElementById("fileName");
     const deleteSelectedButton = document.getElementById("deleteSelectedButton");
@@ -189,6 +243,7 @@
     let sortDirection = 1;
     let previewUrl = null;
     let ffmpegPromise = null;
+    let encodingSettings = loadEncodingSettings();
 
     function showNotice(message, kind) {
       notice.textContent = message || "";
@@ -204,12 +259,65 @@
       }
       refreshButton.disabled = !port || busy;
       uploadButton.disabled = !port || busy || selectedFiles.length === 0;
+      settingsButton.disabled = busy;
       fileInput.disabled = busy;
       connectButton.disabled = busy;
       for (const button of fileRows.querySelectorAll("button")) button.disabled = !port || busy;
       for (const checkbox of fileRows.querySelectorAll("input.file-select")) checkbox.disabled = !port || busy;
       updateSelectionControls();
       updateSortHeaders();
+    }
+
+    function validEncodingSettings(settings) {
+      const inRange = function (value, min, max) { return Number.isFinite(value) && value >= min && value <= max; };
+      return inRange(settings.loudness, -70, -5) &&
+        inRange(settings.firstPeak, -9, 0) &&
+        inRange(settings.lra, 1, 50) &&
+        inRange(settings.peakLimit, -9, 0) &&
+        inRange(settings.retryPeak, -9, 0) && settings.retryPeak < settings.peakLimit &&
+        [8000, 12000, 16000, 24000, 48000].includes(settings.sampleRate) &&
+        [1, 2].includes(settings.channels) &&
+        ["voip", "audio", "lowdelay"].includes(settings.application) &&
+        inRange(settings.bitrate, 6, 256) && Number.isInteger(settings.bitrate) &&
+        typeof settings.vbr === "boolean";
+    }
+
+    function loadEncodingSettings() {
+      try {
+        const saved = JSON.parse(localStorage.getItem(ENCODING_SETTINGS_KEY) || "null");
+        const settings = Object.assign({}, DEFAULT_ENCODING_SETTINGS, saved);
+        return validEncodingSettings(settings) ? settings : Object.assign({}, DEFAULT_ENCODING_SETTINGS);
+      } catch (_) {
+        return Object.assign({}, DEFAULT_ENCODING_SETTINGS);
+      }
+    }
+
+    function populateSettingsForm(settings) {
+      document.getElementById("settingLoudness").value = settings.loudness;
+      document.getElementById("settingFirstPeak").value = settings.firstPeak;
+      document.getElementById("settingLra").value = settings.lra;
+      document.getElementById("settingPeakLimit").value = settings.peakLimit;
+      document.getElementById("settingRetryPeak").value = settings.retryPeak;
+      document.getElementById("settingSampleRate").value = settings.sampleRate;
+      document.getElementById("settingChannels").value = settings.channels;
+      document.getElementById("settingApplication").value = settings.application;
+      document.getElementById("settingBitrate").value = settings.bitrate;
+      document.getElementById("settingVbr").checked = settings.vbr;
+    }
+
+    function readSettingsForm() {
+      return {
+        loudness: Number(document.getElementById("settingLoudness").value),
+        firstPeak: Number(document.getElementById("settingFirstPeak").value),
+        lra: Number(document.getElementById("settingLra").value),
+        peakLimit: Number(document.getElementById("settingPeakLimit").value),
+        retryPeak: Number(document.getElementById("settingRetryPeak").value),
+        sampleRate: Number(document.getElementById("settingSampleRate").value),
+        channels: Number(document.getElementById("settingChannels").value),
+        application: document.getElementById("settingApplication").value,
+        bitrate: Number(document.getElementById("settingBitrate").value),
+        vbr: document.getElementById("settingVbr").checked
+      };
     }
 
     function updateSelectionControls() {
@@ -350,22 +458,22 @@
       return (name.replace(/\.[^.]*$/, "") || "audio") + ".opus";
     }
 
-    async function convertAudioToOpus(file, outputName) {
+    async function convertAudioToOpus(file, outputName, settings) {
       const ffmpeg = await loadFfmpeg();
       const encode = async function (truePeak) {
         await runFfmpeg(ffmpeg, [
           "-y", "-i", "input", "-map", "0:a:0", "-map_metadata", "0", "-vn",
-          "-af", "loudnorm=I=-16:TP=" + truePeak + ":LRA=7",
-          "-ar", "48000", "-ac", "1", "-c:a", "libopus", "-application", "voip", "-b:a", "32k", "-vbr", "on", "output.opus"
+          "-af", "loudnorm=I=" + settings.loudness + ":TP=" + truePeak + ":LRA=" + settings.lra,
+          "-ar", String(settings.sampleRate), "-ac", String(settings.channels), "-c:a", "libopus", "-application", settings.application, "-b:a", settings.bitrate + "k", "-vbr", settings.vbr ? "on" : "off", "output.opus"
         ]);
       };
 
       try {
         await ffmpeg.writeFile("input", new Uint8Array(await file.arrayBuffer()));
-        await encode(-2);
+        await encode(settings.firstPeak);
         let truePeak = await measureTruePeak(ffmpeg);
-        if (truePeak > -1) {
-          await encode(-4);
+        if (truePeak > settings.peakLimit) {
+          await encode(settings.retryPeak);
           truePeak = await measureTruePeak(ffmpeg);
         }
         const bytes = new Uint8Array(await ffmpeg.readFile("output.opus"));
@@ -375,7 +483,7 @@
         }
         return {
           file: new File([bytes], outputName, { type: "audio/ogg; codecs=opus" }),
-          peakWarning: truePeak > -1
+          peakWarning: truePeak > settings.peakLimit
         };
       } finally {
         try { await ffmpeg.deleteFile("input"); } catch (_) {}
@@ -737,7 +845,7 @@
       }
     }
 
-    async function uploadOneFile(sourceFile, batchIndex, batchTotal) {
+    async function uploadOneFile(sourceFile, batchIndex, batchTotal, settings) {
       const isOpus = sourceFile.name.toLowerCase().endsWith(".opus");
       const uploadName = isOpus ? sourceFile.name : opusFileName(sourceFile.name);
       if (sourceFile.size === 0) {
@@ -760,7 +868,7 @@
         progress.removeAttribute("value");
         progressLabel.textContent = label + ": Lade FFmpeg und wandle lokal in Ogg/Opus um …";
         showNotice(sourceFile.name + " wird lokal normalisiert und kodiert …");
-        const converted = await convertAudioToOpus(sourceFile, uploadName);
+        const converted = await convertAudioToOpus(sourceFile, uploadName, settings);
         uploadFile = converted.file;
         peakWarning = converted.peakWarning;
         progress.value = 0;
@@ -803,6 +911,7 @@
       let skipped = 0;
       let peakWarnings = 0;
       let processed = 0;
+      const batchSettings = Object.assign({}, encodingSettings);
       setBusy(true);
       progress.hidden = false;
       showNotice("");
@@ -811,7 +920,7 @@
           const sourceFile = selectedFiles[0];
           const batchIndex = processed + 1;
           try {
-            const result = await uploadOneFile(sourceFile, batchIndex, batchTotal);
+            const result = await uploadOneFile(sourceFile, batchIndex, batchTotal, batchSettings);
             selectedFiles.shift();
             processed++;
             if (result.skipped) skipped++;
@@ -832,7 +941,8 @@
         fileInput.value = "";
         progress.value = 100;
         progressLabel.textContent = "Fertig: " + uploaded + " hochgeladen, " + skipped + " übersprungen.";
-        const warning = peakWarnings ? " " + peakWarnings + " Datei(en) liegen weiterhin über −1 dBFS Spitzenpegel." : "";
+        const warningLimit = String(batchSettings.peakLimit).replace("-", "−");
+        const warning = peakWarnings ? " " + peakWarnings + " Datei(en) liegen weiterhin über " + warningLimit + " dBFS Spitzenpegel." : "";
         showNotice("Batch abgeschlossen: " + uploaded + " hochgeladen, " + skipped + " übersprungen." + warning, peakWarnings ? "warning" : skipped ? "warning" : "success");
       } finally {
         setBusy(false);
@@ -897,6 +1007,29 @@
     connectButton.addEventListener("click", connect);
     refreshButton.addEventListener("click", refreshFiles);
     uploadButton.addEventListener("click", uploadFile);
+    settingsButton.addEventListener("click", function () {
+      populateSettingsForm(encodingSettings);
+      settingsDialog.showModal();
+    });
+    cancelSettingsButton.addEventListener("click", function () { settingsDialog.close(); });
+    settingsForm.addEventListener("submit", function (event) {
+      event.preventDefault();
+      const settings = readSettingsForm();
+      if (!validEncodingSettings(settings)) {
+        document.getElementById("settingRetryPeak").setCustomValidity("Das Ziel muss niedriger sein als der Spitzenpegel für den erneuten Durchlauf.");
+        settingsForm.reportValidity();
+        document.getElementById("settingRetryPeak").setCustomValidity("");
+        return;
+      }
+      encodingSettings = settings;
+      try {
+        localStorage.setItem(ENCODING_SETTINGS_KEY, JSON.stringify(encodingSettings));
+        showNotice("Konvertierungseinstellungen gespeichert.", "success");
+      } catch (_) {
+        showNotice("Einstellungen gelten bis zum Schliessen dieser Seite, konnten aber nicht dauerhaft gespeichert werden.", "warning");
+      }
+      settingsDialog.close();
+    });
     deleteSelectedButton.addEventListener("click", deleteSelectedFiles);
     sortNameButton.addEventListener("click", function () { changeSort("name"); });
     sortSizeButton.addEventListener("click", function () { changeSort("size"); });
