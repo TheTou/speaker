@@ -191,6 +191,8 @@
     const CHUNK_FALLBACK = 512;
     const FFMPEG_VERSION = "0.12.10";
     const FFMPEG_CDN = "https://cdn.jsdelivr.net/npm";
+    const LOUDNESS_TOLERANCE = 0.5;
+    const MAX_LOUDNESS_CORRECTIONS = 3;
     const DEFAULT_ENCODING_SETTINGS = Object.freeze({
       loudness: -16,
       firstPeak: -2,
@@ -435,7 +437,7 @@
       if (exitCode !== 0) throw new Error("Die Audiodatei konnte nicht verarbeitet werden. Bitte ein unterstütztes Audioformat wählen.");
     }
 
-    async function measureTruePeak(ffmpeg) {
+    async function measureOutputMetrics(ffmpeg) {
       const lines = [];
       const onLog = function (event) { lines.push(event.message); };
       ffmpeg.on("log", onLog);
@@ -444,9 +446,16 @@
       } finally {
         ffmpeg.off("log", onLog);
       }
-      const match = lines.join("\n").match(/True peak:[\s\S]{0,120}?Peak:\s*(-inf|[-+]?(?:\d+(?:\.\d*)?|\.\d+))\s*dBFS/i);
-      if (!match) throw new Error("Der Spitzenpegel der konvertierten Datei konnte nicht geprüft werden.");
-      return match[1].toLowerCase() === "-inf" ? -Infinity : Number(match[1]);
+      const log = lines.join("\n");
+      const loudnessMatches = Array.from(log.matchAll(/Integrated loudness:[\s\S]{0,200}?\bI:\s*(-inf|[-+]?(?:\d+(?:\.\d*)?|\.\d+))\s*LUFS/gi));
+      const peakMatches = Array.from(log.matchAll(/True peak:[\s\S]{0,120}?Peak:\s*(-inf|[-+]?(?:\d+(?:\.\d*)?|\.\d+))\s*dBFS/gi));
+      if (!loudnessMatches.length) throw new Error("Die integrierte Lautheit der konvertierten Datei konnte nicht geprüft werden.");
+      if (!peakMatches.length) throw new Error("Der Spitzenpegel der konvertierten Datei konnte nicht geprüft werden.");
+      const parseLevel = function (match) { return match.toLowerCase() === "-inf" ? -Infinity : Number(match); };
+      return {
+        integratedLoudness: parseLevel(loudnessMatches[loudnessMatches.length - 1][1]),
+        truePeak: parseLevel(peakMatches[peakMatches.length - 1][1])
+      };
     }
 
     function opusFileName(name) {
@@ -455,21 +464,39 @@
 
     async function convertAudioToOpus(file, outputName, settings) {
       const ffmpeg = await loadFfmpeg();
-      const encode = async function (truePeak) {
+      const encode = async function (targetLoudness, truePeak) {
         await runFfmpeg(ffmpeg, [
           "-y", "-i", "input", "-map", "0:a:0", "-map_metadata", "0", "-vn",
-          "-af", "loudnorm=I=" + settings.loudness + ":TP=" + truePeak + ":LRA=" + settings.lra,
+          "-af", "loudnorm=I=" + targetLoudness + ":TP=" + truePeak + ":LRA=" + settings.lra,
           "-ar", String(settings.sampleRate), "-ac", String(settings.channels), "-c:a", "libopus", "-application", settings.application, "-b:a", settings.bitrate + "k", "-vbr", settings.vbr ? "on" : "off", "output.opus"
         ]);
       };
 
       try {
         await ffmpeg.writeFile("input", new Uint8Array(await file.arrayBuffer()));
-        await encode(settings.firstPeak);
-        let truePeak = await measureTruePeak(ffmpeg);
-        if (truePeak > settings.peakLimit) {
-          await encode(settings.retryPeak);
-          truePeak = await measureTruePeak(ffmpeg);
+        let targetLoudness = settings.loudness;
+        let truePeakTarget = settings.firstPeak;
+        let metrics;
+        for (let attempt = 0; attempt <= MAX_LOUDNESS_CORRECTIONS; attempt++) {
+          await encode(targetLoudness, truePeakTarget);
+          metrics = await measureOutputMetrics(ffmpeg);
+          if (!Number.isFinite(metrics.integratedLoudness)) {
+            throw new Error("Die integrierte Lautheit ist nicht messbar; die Datei wurde nicht übertragen.");
+          }
+          const loudnessError = settings.loudness - metrics.integratedLoudness;
+          const loudnessOk = Math.abs(loudnessError) <= LOUDNESS_TOLERANCE;
+          const retryForPeak = metrics.truePeak > settings.peakLimit && truePeakTarget !== settings.retryPeak;
+          if (loudnessOk && !retryForPeak) break;
+          if (retryForPeak) truePeakTarget = settings.retryPeak;
+          if (!loudnessOk) {
+            const adjustedTarget = Math.max(-70, Math.min(-5, targetLoudness + loudnessError));
+            if (adjustedTarget === targetLoudness && !retryForPeak) break;
+            targetLoudness = adjustedTarget;
+          }
+        }
+        if (Math.abs(settings.loudness - metrics.integratedLoudness) > LOUDNESS_TOLERANCE) {
+          const formatLevel = function (value) { return value.toFixed(1).replace("-", "−").replace(".", ","); };
+          throw new Error("Ziel-Lautheit nicht erreicht: Ziel " + formatLevel(settings.loudness) + " LUFS, gemessen " + formatLevel(metrics.integratedLoudness) + " LUFS (Toleranz ±0,5 LUFS). Mögliche Ursachen sind True-Peak-Grenze oder Dynamik des Materials.");
         }
         const bytes = new Uint8Array(await ffmpeg.readFile("output.opus"));
         const header = new TextDecoder().decode(bytes.subarray(0, 128));
@@ -478,7 +505,7 @@
         }
         return {
           file: new File([bytes], outputName, { type: "audio/ogg; codecs=opus" }),
-          peakWarning: truePeak > settings.peakLimit
+          peakWarning: metrics.truePeak > settings.peakLimit
         };
       } finally {
         try { await ffmpeg.deleteFile("input"); } catch (_) {}
