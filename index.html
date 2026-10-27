@@ -134,7 +134,7 @@
         <label class="file-picker" for="fileInput">Audiodateien auswählen</label>
         <input id="fileInput" type="file" accept="audio/*,.opus" multiple>
         <span id="fileName" class="file-name">Keine Datei ausgewählt</span>
-        <button id="settingsButton" class="secondary" type="button">Einstellungen</button>
+        <button id="settingsButton" class="secondary" type="button" disabled>Einstellungen</button>
         <button id="uploadButton" type="button" disabled>Hochladen</button>
       </div>
       <progress id="progress" max="100" value="0" hidden></progress>
@@ -177,7 +177,7 @@
         <label>Bitrate (kbit/s)<input id="settingBitrate" type="number" min="6" max="256" step="1" required></label>
         <label class="checkbox-setting"><input id="settingVbr" type="checkbox"> Variable Bitrate (VBR)</label>
       </div>
-      <p class="settings-note">48 kHz und Mono sind für den ESP32 voreingestellt. Andere Werte können die Wiedergabe auf dem Gerät beeinflussen. Einstellungen werden in diesem Browser gespeichert.</p>
+      <p class="settings-note">48 kHz und Mono sind voreingestellt. Andere Werte können die Wiedergabe beeinflussen. Einstellungen werden auf diesem ESP32 gespeichert.</p>
       <div class="settings-actions">
         <button id="cancelSettingsButton" class="secondary" type="button">Abbrechen</button>
         <button type="submit">Speichern</button>
@@ -191,7 +191,6 @@
     const CHUNK_FALLBACK = 512;
     const FFMPEG_VERSION = "0.12.10";
     const FFMPEG_CDN = "https://cdn.jsdelivr.net/npm";
-    const ENCODING_SETTINGS_KEY = "soundManagerEncodingSettings";
     const DEFAULT_ENCODING_SETTINGS = Object.freeze({
       loudness: -16,
       firstPeak: -2,
@@ -243,11 +242,16 @@
     let sortDirection = 1;
     let previewUrl = null;
     let ffmpegPromise = null;
-    let encodingSettings = loadEncodingSettings();
+    let encodingSettings = Object.assign({}, DEFAULT_ENCODING_SETTINGS);
+    let encodingSettingsLoaded = false;
 
     function showNotice(message, kind) {
       notice.textContent = message || "";
       notice.className = kind || "";
+    }
+
+    function needsEncodingSettings(files) {
+      return files.some(function (file) { return !file.name.toLowerCase().endsWith(".opus"); });
     }
 
     function setBusy(value) {
@@ -258,8 +262,9 @@
         filesystemUsageLabel.textContent = "Nicht verbunden";
       }
       refreshButton.disabled = !port || busy;
-      uploadButton.disabled = !port || busy || selectedFiles.length === 0;
-      settingsButton.disabled = busy;
+      uploadButton.disabled = !port || busy || selectedFiles.length === 0 || (!encodingSettingsLoaded && needsEncodingSettings(selectedFiles));
+      settingsButton.disabled = !port || busy;
+      for (const control of settingsForm.elements) control.disabled = busy;
       fileInput.disabled = busy;
       connectButton.disabled = busy;
       for (const button of fileRows.querySelectorAll("button")) button.disabled = !port || busy;
@@ -280,16 +285,6 @@
         ["voip", "audio", "lowdelay"].includes(settings.application) &&
         inRange(settings.bitrate, 6, 256) && Number.isInteger(settings.bitrate) &&
         typeof settings.vbr === "boolean";
-    }
-
-    function loadEncodingSettings() {
-      try {
-        const saved = JSON.parse(localStorage.getItem(ENCODING_SETTINGS_KEY) || "null");
-        const settings = Object.assign({}, DEFAULT_ENCODING_SETTINGS, saved);
-        return validEncodingSettings(settings) ? settings : Object.assign({}, DEFAULT_ENCODING_SETTINGS);
-      } catch (_) {
-        return Object.assign({}, DEFAULT_ENCODING_SETTINGS);
-      }
     }
 
     function populateSettingsForm(settings) {
@@ -506,6 +501,8 @@
         commit_failed: "Der Upload konnte nicht abgeschlossen werden.",
         transfer_timeout: "Der Upload wurde wegen einer Unterbrechung abgebrochen.",
         invalid_command: "Der ESP32 hat den Befehl nicht verstanden.",
+        invalid_settings: "Die Encoder-Einstellungen sind ungültig.",
+        settings_failed: "Die Einstellungen konnten nicht dauerhaft auf dem ESP32 gespeichert werden.",
         command_too_long: "Der Befehl war zu lang.",
         unknown_command: "Der ESP32 kennt diesen Befehl nicht."
       };
@@ -573,6 +570,7 @@
           rejectWaiters(new Error("USB-Verbindung wurde getrennt."));
           try { currentWriter.releaseLock(); } catch (_) {}
           try { await currentPort.close(); } catch (_) {}
+          encodingSettingsLoaded = false;
           status.textContent = "Nicht verbunden";
           setBusy(false);
           showNotice("USB-Verbindung wurde getrennt.", "error");
@@ -597,6 +595,46 @@
           return files;
         }
       }
+    }
+
+    async function readDeviceEncodingSettings() {
+      await sendCommand({ cmd: "GET_SETTINGS" });
+      const message = await nextMessage();
+      if (message.type === "error") {
+        if (message.code === "unknown_command") throw new Error("Die ESP32-Firmware unterstützt Geräteeinstellungen noch nicht. Bitte die aktualisierte Firmware flashen.");
+        throw new Error(explainError(message.code));
+      }
+      if (message.type !== "settings") throw new Error("Der ESP32 hat keine Einstellungen zurückgegeben.");
+      const settings = {
+        loudness: Number(message.loudness10) / 10,
+        firstPeak: Number(message.firstPeak10) / 10,
+        lra: Number(message.lra10) / 10,
+        peakLimit: Number(message.peakLimit10) / 10,
+        retryPeak: Number(message.retryPeak10) / 10,
+        sampleRate: Number(message.sampleRate),
+        channels: Number(message.channels),
+        application: message.application,
+        bitrate: Number(message.bitrate),
+        vbr: message.vbr
+      };
+      if (!validEncodingSettings(settings)) throw new Error("Der ESP32 hat ungültige Encoder-Einstellungen gespeichert.");
+      return settings;
+    }
+
+    function deviceSettingsCommand(settings) {
+      return {
+        cmd: "SET_SETTINGS",
+        loudness10: Math.round(settings.loudness * 10),
+        firstPeak10: Math.round(settings.firstPeak * 10),
+        lra10: Math.round(settings.lra * 10),
+        peakLimit10: Math.round(settings.peakLimit * 10),
+        retryPeak10: Math.round(settings.retryPeak * 10),
+        sampleRate: settings.sampleRate,
+        channels: settings.channels,
+        application: settings.application,
+        bitrate: settings.bitrate,
+        vbr: settings.vbr
+      };
     }
 
     function decodeBase64(value) {
@@ -905,7 +943,7 @@
     }
 
     async function uploadFile() {
-      if (!port || busy || !selectedFiles.length) return;
+      if (!port || busy || !selectedFiles.length || (!encodingSettingsLoaded && needsEncodingSettings(selectedFiles))) return;
       const batchTotal = selectedFiles.length;
       let uploaded = 0;
       let skipped = 0;
@@ -966,13 +1004,22 @@
         waiters = [];
         reader = port.readable.getReader();
         writer = port.writable.getWriter();
+        encodingSettingsLoaded = false;
         status.textContent = "Verbunden";
         connectButton.textContent = "Port trennen";
-        refreshButton.disabled = false;
-        uploadButton.disabled = selectedFiles.length === 0;
-        showNotice("Verbunden. Dateiliste wird geladen …");
         void readResponses(reader, port, writer);
-        await refreshFiles();
+        setBusy(true);
+        showNotice("Verbunden. Dateiliste und Einstellungen werden geladen …");
+        try {
+          renderFiles(await listFiles());
+          encodingSettings = await readDeviceEncodingSettings();
+          encodingSettingsLoaded = true;
+          showNotice("Dateien und Encoder-Einstellungen vom ESP32 geladen.", "success");
+        } catch (error) {
+          showNotice(error.message, "error");
+        } finally {
+          setBusy(false);
+        }
       } catch (error) {
         if (error.name !== "NotFoundError") showNotice(error.message, "error");
       }
@@ -985,6 +1032,7 @@
       port = null;
       reader = null;
       writer = null;
+      encodingSettingsLoaded = false;
       rejectWaiters(new Error("Port getrennt."));
       if (oldReader) {
         try { await oldReader.cancel(); } catch (_) {}
@@ -1007,12 +1055,25 @@
     connectButton.addEventListener("click", connect);
     refreshButton.addEventListener("click", refreshFiles);
     uploadButton.addEventListener("click", uploadFile);
-    settingsButton.addEventListener("click", function () {
-      populateSettingsForm(encodingSettings);
-      settingsDialog.showModal();
+    settingsButton.addEventListener("click", async function () {
+      if (!port || busy) return;
+      encodingSettingsLoaded = false;
+      setBusy(true);
+      showNotice("Einstellungen werden vom ESP32 geladen …");
+      try {
+        encodingSettings = await readDeviceEncodingSettings();
+        encodingSettingsLoaded = true;
+        populateSettingsForm(encodingSettings);
+        settingsDialog.showModal();
+        showNotice("");
+      } catch (error) {
+        showNotice(error.message, "error");
+      } finally {
+        setBusy(false);
+      }
     });
     cancelSettingsButton.addEventListener("click", function () { settingsDialog.close(); });
-    settingsForm.addEventListener("submit", function (event) {
+    settingsForm.addEventListener("submit", async function (event) {
       event.preventDefault();
       const settings = readSettingsForm();
       if (!validEncodingSettings(settings)) {
@@ -1021,14 +1082,26 @@
         document.getElementById("settingRetryPeak").setCustomValidity("");
         return;
       }
-      encodingSettings = settings;
-      try {
-        localStorage.setItem(ENCODING_SETTINGS_KEY, JSON.stringify(encodingSettings));
-        showNotice("Konvertierungseinstellungen gespeichert.", "success");
-      } catch (_) {
-        showNotice("Einstellungen gelten bis zum Schliessen dieser Seite, konnten aber nicht dauerhaft gespeichert werden.", "warning");
+      if (!port || busy) {
+        showNotice("Zum Speichern muss der ESP32 verbunden sein.", "error");
+        return;
       }
-      settingsDialog.close();
+      setBusy(true);
+      showNotice("Einstellungen werden auf dem ESP32 gespeichert …");
+      try {
+        await sendCommand(deviceSettingsCommand(settings));
+        const result = await nextMessage();
+        if (result.type === "error") throw new Error(explainError(result.code));
+        if (result.type !== "ok" || result.cmd !== "SET_SETTINGS") throw new Error("Der ESP32 hat das Speichern nicht bestätigt.");
+        encodingSettings = settings;
+        encodingSettingsLoaded = true;
+        settingsDialog.close();
+        showNotice("Einstellungen dauerhaft auf dem ESP32 gespeichert.", "success");
+      } catch (error) {
+        showNotice(error.message, "error");
+      } finally {
+        setBusy(false);
+      }
     });
     deleteSelectedButton.addEventListener("click", deleteSelectedFiles);
     sortNameButton.addEventListener("click", function () { changeSort("name"); });
@@ -1047,7 +1120,7 @@
       fileName.textContent = selectedFiles.length === 0
         ? "Keine Datei ausgewählt"
         : selectedFiles.length === 1 ? selectedFiles[0].name : selectedFiles.length + " Dateien ausgewählt";
-      uploadButton.disabled = !port || busy || selectedFiles.length === 0;
+      uploadButton.disabled = !port || busy || selectedFiles.length === 0 || (!encodingSettingsLoaded && needsEncodingSettings(selectedFiles));
     });
 
     window.addEventListener("pagehide", function () {
