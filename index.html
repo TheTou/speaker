@@ -566,7 +566,12 @@
           if (retryForPeak) truePeakTarget = settings.retryPeak;
           let loudnessTargetChanged = false;
           if (!loudnessOk) {
-            const adjustedTarget = Math.max(-70, Math.min(-5, targetLoudness + loudnessError));
+            let adjustedTarget = Math.max(-70, Math.min(-5, targetLoudness + loudnessError));
+            if (Number(inputStats.input_lra) <= settings.lra) {
+              // Keep correction inside loudnorm's linear true-peak limit; dynamic mode can suppress very short clips.
+              const maxLinearTarget = truePeakTarget - Number(inputStats.input_tp) + Number(inputStats.input_i);
+              adjustedTarget = Math.max(-70, Math.min(adjustedTarget, maxLinearTarget));
+            }
             loudnessTargetChanged = adjustedTarget !== targetLoudness;
             targetLoudness = adjustedTarget;
           }
