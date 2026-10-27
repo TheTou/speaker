@@ -551,10 +551,12 @@
           if (!retryForPeak && !loudnessTargetChanged) break;
         }
         if (Math.abs(settings.loudness - metrics.integratedLoudness) > LOUDNESS_TOLERANCE) {
-          throw new Error("Ziel-Lautheit nicht erreicht: Ziel " + formatAudioLevel(settings.loudness) + " LUFS, gemessen " + formatAudioLevel(metrics.integratedLoudness) + " LUFS (Toleranz ±0,5 LUFS). True Peak: " + formatAudioLevel(metrics.truePeak) + " dBTP bei maximal " + formatAudioLevel(settings.peakLimit) + " dBTP.");
+          const nextStep = settings.preset === "loud" ? "Wähle „Normal“ oder „Leise“." : settings.preset === "normal" ? "Probiere „Leise“." : "Bitte wähle eine andere Datei.";
+          throw new Error("Das Profil „" + ENCODING_PRESETS[settings.preset].label + "“ konnte diese Datei nicht sicher anpassen. Sie wurde nicht übertragen. " + nextStep);
         }
         if (metrics.truePeak > settings.peakLimit) {
-          throw new Error("True-Peak-Grenze nach Opus-Encoding überschritten: gemessen " + formatAudioLevel(metrics.truePeak) + " dBTP, maximal " + formatAudioLevel(settings.peakLimit) + " dBTP.");
+          const nextStep = settings.preset === "loud" ? "Wähle „Normal“ oder „Leise“." : "Wähle „Leise“ oder eine andere Datei.";
+          throw new Error("Das Profil „" + ENCODING_PRESETS[settings.preset].label + "“ würde diese Datei übersteuern. Sie wurde nicht übertragen. " + nextStep);
         }
         const bytes = new Uint8Array(await ffmpeg.readFile("output.opus"));
         const header = new TextDecoder().decode(bytes.subarray(0, 128));
@@ -993,7 +995,7 @@
         const converted = await convertAudioToOpus(sourceFile, uploadName, settings);
         uploadFile = converted.file;
         progress.value = 0;
-        progressLabel.textContent = label + ": " + formatAudioLevel(converted.metrics.integratedLoudness) + " LUFS, " + formatAudioLevel(converted.metrics.truePeak) + " dBTP. Upload startet …";
+        progressLabel.textContent = label + ": Lautstärke geprüft. Upload startet …";
       }
 
       await sendCommand({ cmd: "UPLOAD", name: uploadName, size: uploadFile.size, replace: replace });
