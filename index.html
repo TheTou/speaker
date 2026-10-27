@@ -504,12 +504,8 @@
 
     async function convertAudioToOpus(file, outputName, settings) {
       const ffmpeg = await loadFfmpeg();
+      let inputStats;
       const encode = async function (targetLoudness, truePeak) {
-        const analysisLog = await runFfmpegAndCapture(ffmpeg, [
-          "-hide_banner", "-nostats", "-loglevel", "info", "-i", "input", "-map", "0:a:0", "-vn",
-          "-af", buildAudioFilter(settings, targetLoudness, truePeak, null), "-f", "null", "-"
-        ]);
-        const inputStats = parseLoudnormStats(analysisLog);
         await runFfmpeg(ffmpeg, [
           "-y", "-i", "input", "-map", "0:a:0", "-map_metadata", "0", "-vn",
           "-af", buildAudioFilter(settings, targetLoudness, truePeak, inputStats),
@@ -519,6 +515,11 @@
 
       try {
         await ffmpeg.writeFile("input", new Uint8Array(await file.arrayBuffer()));
+        const analysisLog = await runFfmpegAndCapture(ffmpeg, [
+          "-hide_banner", "-nostats", "-loglevel", "info", "-i", "input", "-map", "0:a:0", "-vn",
+          "-af", buildAudioFilter(settings, settings.loudness, settings.firstPeak, null), "-f", "null", "-"
+        ]);
+        inputStats = parseLoudnormStats(analysisLog);
         let targetLoudness = settings.loudness;
         let truePeakTarget = settings.firstPeak;
         let metrics;
