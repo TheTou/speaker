@@ -637,6 +637,8 @@
     }
 
     function deliver(message) {
+      // Older firmware answers PING with unknown_command instead of PONG.
+      if (message.type === "pong" || (message.type === "error" && message.code === "unknown_command")) return;
       const waiter = waiters.shift();
       if (waiter) {
         clearTimeout(waiter.timer);
@@ -1024,7 +1026,15 @@
         progress.removeAttribute("value");
         progressLabel.textContent = label + ": Lade FFmpeg und wandle lokal in Ogg/Opus um …";
         showNotice(sourceFile.name + " wird lokal normalisiert und kodiert …");
-        const converted = await convertAudioToOpus(sourceFile, uploadName, settings);
+        const keepalive = setInterval(function () {
+          void sendCommand({ cmd: "PING" }).catch(function () {});
+        }, 5000);
+        let converted;
+        try {
+          converted = await convertAudioToOpus(sourceFile, uploadName, settings);
+        } finally {
+          clearInterval(keepalive);
+        }
         uploadFile = converted.file;
         progress.value = 0;
         progressLabel.textContent = label + ": Lautstärke geprüft. Upload startet …";
