@@ -169,7 +169,7 @@
         <label>Integrierte Lautheit (LUFS)<input id="settingLoudness" type="number" min="-70" max="-5" step="0.1" required></label>
         <label>True-Peak-Ziel, erster Durchlauf (dBTP)<input id="settingFirstPeak" type="number" min="-9" max="0" step="0.1" required></label>
         <label>Loudness Range (LU)<input id="settingLra" type="number" min="1" max="50" step="0.1" required></label>
-        <label>Erneut enkodieren ab Spitzenpegel (dBFS)<input id="settingPeakLimit" type="number" min="-9" max="0" step="0.1" required></label>
+        <label>Maximaler True Peak der fertigen Datei (dBTP)<input id="settingPeakLimit" type="number" min="-9" max="0" step="0.1" required></label>
         <label>True-Peak-Ziel beim erneuten Enkodieren (dBTP)<input id="settingRetryPeak" type="number" min="-9" max="0" step="0.1" required></label>
         <label>Samplerate<select id="settingSampleRate"><option value="8000">8.000 Hz</option><option value="12000">12.000 Hz</option><option value="16000">16.000 Hz</option><option value="24000">24.000 Hz</option><option value="48000">48.000 Hz</option></select></label>
         <label>Kanäle<select id="settingChannels"><option value="1">Mono</option><option value="2">Stereo</option></select></label>
@@ -177,7 +177,7 @@
         <label>Bitrate (kbit/s)<input id="settingBitrate" type="number" min="6" max="256" step="1" required></label>
         <label class="checkbox-setting"><input id="settingVbr" type="checkbox"> Variable Bitrate (VBR)</label>
       </div>
-      <p class="settings-note">48 kHz und Mono sind voreingestellt. Andere Werte können die Wiedergabe beeinflussen. Einstellungen werden auf diesem ESP32 gespeichert.</p>
+      <p class="settings-note">48 kHz und Mono sind voreingestellt. Kompression und Downmix erfolgen vor der Lautheitsmessung. Nach dem Opus-Encoding wird geprüft; bei verfehltem LUFS-Ziel oder True-Peak-Limit wird nicht übertragen. Einstellungen werden auf diesem ESP32 gespeichert.</p>
       <div class="settings-actions">
         <button id="cancelSettingsButton" class="secondary" type="button">Abbrechen</button>
         <button type="submit">Speichern</button>
@@ -193,6 +193,7 @@
     const FFMPEG_CDN = "https://cdn.jsdelivr.net/npm";
     const LOUDNESS_TOLERANCE = 0.5;
     const MAX_LOUDNESS_CORRECTIONS = 3;
+    const PRE_OPUS_COMPRESSOR = "acompressor=threshold=0.126:ratio=3:attack=10:release=150:makeup=1";
     const DEFAULT_ENCODING_SETTINGS = Object.freeze({
       loudness: -16,
       firstPeak: -2,
@@ -437,16 +438,55 @@
       if (exitCode !== 0) throw new Error("Die Audiodatei konnte nicht verarbeitet werden. Bitte ein unterstütztes Audioformat wählen.");
     }
 
-    async function measureOutputMetrics(ffmpeg) {
+    async function runFfmpegAndCapture(ffmpeg, args) {
       const lines = [];
       const onLog = function (event) { lines.push(event.message); };
       ffmpeg.on("log", onLog);
       try {
-        await runFfmpeg(ffmpeg, ["-hide_banner", "-loglevel", "info", "-i", "output.opus", "-af", "ebur128=peak=true", "-f", "null", "-"]);
+        await runFfmpeg(ffmpeg, args);
+        return lines.join("\n");
       } finally {
         ffmpeg.off("log", onLog);
       }
-      const log = lines.join("\n");
+    }
+
+    function buildAudioFilter(settings, targetLoudness, truePeak, inputStats) {
+      const filters = [
+        "aresample=" + settings.sampleRate,
+        "aformat=channel_layouts=" + (settings.channels === 1 ? "mono" : "stereo"),
+        PRE_OPUS_COMPRESSOR,
+        "loudnorm=I=" + targetLoudness + ":TP=" + truePeak + ":LRA=" + settings.lra
+      ];
+      if (inputStats) {
+        filters[filters.length - 1] += ":measured_I=" + inputStats.input_i +
+          ":measured_TP=" + inputStats.input_tp +
+          ":measured_LRA=" + inputStats.input_lra +
+          ":measured_thresh=" + inputStats.input_thresh + ":linear=true";
+      } else {
+        filters[filters.length - 1] += ":print_format=json";
+      }
+      return filters.join(",");
+    }
+
+    function parseLoudnormStats(log) {
+      const match = log.match(/\{\s*"input_i"\s*:[\s\S]*?\}/);
+      if (!match) throw new Error("Die Lautheitsanalyse vor dem Encode ist fehlgeschlagen.");
+      let stats;
+      try { stats = JSON.parse(match[0]); } catch (_) {
+        throw new Error("Die Lautheitsanalyse lieferte ungültige Messwerte.");
+      }
+      if (![stats.input_i, stats.input_tp, stats.input_lra, stats.input_thresh].every(function (value) { return Number.isFinite(Number(value)); })) {
+        throw new Error("Die Lautheitsanalyse lieferte keine vollständigen Messwerte.");
+      }
+      return stats;
+    }
+
+    function formatAudioLevel(value) {
+      return value.toFixed(1).replace("-", "−").replace(".", ",");
+    }
+
+    async function measureOutputMetrics(ffmpeg) {
+      const log = await runFfmpegAndCapture(ffmpeg, ["-hide_banner", "-loglevel", "info", "-i", "output.opus", "-af", "ebur128=peak=true", "-f", "null", "-"]);
       const loudnessMatches = Array.from(log.matchAll(/Integrated loudness:[\s\S]{0,200}?\bI:\s*(-inf|[-+]?(?:\d+(?:\.\d*)?|\.\d+))\s*LUFS/gi));
       const peakMatches = Array.from(log.matchAll(/True peak:[\s\S]{0,120}?Peak:\s*(-inf|[-+]?(?:\d+(?:\.\d*)?|\.\d+))\s*dBFS/gi));
       if (!loudnessMatches.length) throw new Error("Die integrierte Lautheit der konvertierten Datei konnte nicht geprüft werden.");
@@ -465,9 +505,14 @@
     async function convertAudioToOpus(file, outputName, settings) {
       const ffmpeg = await loadFfmpeg();
       const encode = async function (targetLoudness, truePeak) {
+        const analysisLog = await runFfmpegAndCapture(ffmpeg, [
+          "-hide_banner", "-nostats", "-loglevel", "info", "-i", "input", "-map", "0:a:0", "-vn",
+          "-af", buildAudioFilter(settings, targetLoudness, truePeak, null), "-f", "null", "-"
+        ]);
+        const inputStats = parseLoudnormStats(analysisLog);
         await runFfmpeg(ffmpeg, [
           "-y", "-i", "input", "-map", "0:a:0", "-map_metadata", "0", "-vn",
-          "-af", "loudnorm=I=" + targetLoudness + ":TP=" + truePeak + ":LRA=" + settings.lra,
+          "-af", buildAudioFilter(settings, targetLoudness, truePeak, inputStats),
           "-ar", String(settings.sampleRate), "-ac", String(settings.channels), "-c:a", "libopus", "-application", settings.application, "-b:a", settings.bitrate + "k", "-vbr", settings.vbr ? "on" : "off", "output.opus"
         ]);
       };
@@ -485,18 +530,23 @@
           }
           const loudnessError = settings.loudness - metrics.integratedLoudness;
           const loudnessOk = Math.abs(loudnessError) <= LOUDNESS_TOLERANCE;
-          const retryForPeak = metrics.truePeak > settings.peakLimit && truePeakTarget !== settings.retryPeak;
-          if (loudnessOk && !retryForPeak) break;
+          const peakOk = metrics.truePeak <= settings.peakLimit;
+          const retryForPeak = !peakOk && truePeakTarget !== settings.retryPeak;
+          if (loudnessOk && peakOk) break;
           if (retryForPeak) truePeakTarget = settings.retryPeak;
+          let loudnessTargetChanged = false;
           if (!loudnessOk) {
             const adjustedTarget = Math.max(-70, Math.min(-5, targetLoudness + loudnessError));
-            if (adjustedTarget === targetLoudness && !retryForPeak) break;
+            loudnessTargetChanged = adjustedTarget !== targetLoudness;
             targetLoudness = adjustedTarget;
           }
+          if (!retryForPeak && !loudnessTargetChanged) break;
         }
         if (Math.abs(settings.loudness - metrics.integratedLoudness) > LOUDNESS_TOLERANCE) {
-          const formatLevel = function (value) { return value.toFixed(1).replace("-", "−").replace(".", ","); };
-          throw new Error("Ziel-Lautheit nicht erreicht: Ziel " + formatLevel(settings.loudness) + " LUFS, gemessen " + formatLevel(metrics.integratedLoudness) + " LUFS (Toleranz ±0,5 LUFS). Mögliche Ursachen sind True-Peak-Grenze oder Dynamik des Materials.");
+          throw new Error("Ziel-Lautheit nicht erreicht: Ziel " + formatAudioLevel(settings.loudness) + " LUFS, gemessen " + formatAudioLevel(metrics.integratedLoudness) + " LUFS (Toleranz ±0,5 LUFS). True Peak: " + formatAudioLevel(metrics.truePeak) + " dBTP bei maximal " + formatAudioLevel(settings.peakLimit) + " dBTP.");
+        }
+        if (metrics.truePeak > settings.peakLimit) {
+          throw new Error("True-Peak-Grenze nach Opus-Encoding überschritten: gemessen " + formatAudioLevel(metrics.truePeak) + " dBTP, maximal " + formatAudioLevel(settings.peakLimit) + " dBTP.");
         }
         const bytes = new Uint8Array(await ffmpeg.readFile("output.opus"));
         const header = new TextDecoder().decode(bytes.subarray(0, 128));
@@ -505,7 +555,7 @@
         }
         return {
           file: new File([bytes], outputName, { type: "audio/ogg; codecs=opus" }),
-          peakWarning: metrics.truePeak > settings.peakLimit
+          metrics: metrics
         };
       } finally {
         try { await ffmpeg.deleteFile("input"); } catch (_) {}
@@ -924,20 +974,18 @@
       const existing = files.find(function (entry) { return entry.name === uploadName; });
       const replace = Boolean(existing);
       if (replace && !window.confirm("„" + uploadName + "“ ist bereits vorhanden. Nach vollständigem Upload ersetzen?")) {
-        return { skipped: true, peakWarning: false };
+        return { skipped: true };
       }
 
       let uploadFile = sourceFile;
-      let peakWarning = false;
       if (!isOpus) {
         progress.removeAttribute("value");
         progressLabel.textContent = label + ": Lade FFmpeg und wandle lokal in Ogg/Opus um …";
         showNotice(sourceFile.name + " wird lokal normalisiert und kodiert …");
         const converted = await convertAudioToOpus(sourceFile, uploadName, settings);
         uploadFile = converted.file;
-        peakWarning = converted.peakWarning;
         progress.value = 0;
-        progressLabel.textContent = label + ": Konvertierung abgeschlossen. Upload startet …";
+        progressLabel.textContent = label + ": " + formatAudioLevel(converted.metrics.integratedLoudness) + " LUFS, " + formatAudioLevel(converted.metrics.truePeak) + " dBTP. Upload startet …";
       }
 
       await sendCommand({ cmd: "UPLOAD", name: uploadName, size: uploadFile.size, replace: replace });
@@ -966,7 +1014,7 @@
       if (finished.type === "error") throw new Error(explainError(finished.code));
       if (finished.type !== "done") throw new Error("Der ESP32 hat den Upload nicht bestätigt.");
       renderFiles(await listFiles());
-      return { skipped: false, peakWarning: peakWarning };
+      return { skipped: false };
     }
 
     async function uploadFile() {
@@ -974,7 +1022,6 @@
       const batchTotal = selectedFiles.length;
       let uploaded = 0;
       let skipped = 0;
-      let peakWarnings = 0;
       let processed = 0;
       const batchSettings = Object.assign({}, encodingSettings);
       setBusy(true);
@@ -989,10 +1036,7 @@
             selectedFiles.shift();
             processed++;
             if (result.skipped) skipped++;
-            else {
-              uploaded++;
-              if (result.peakWarning) peakWarnings++;
-            }
+            else uploaded++;
             fileName.textContent = selectedFiles.length === 0
               ? "Keine Datei ausgewählt"
               : selectedFiles.length === 1 ? selectedFiles[0].name : selectedFiles.length + " Dateien ausgewählt";
@@ -1006,9 +1050,7 @@
         fileInput.value = "";
         progress.value = 100;
         progressLabel.textContent = "Fertig: " + uploaded + " hochgeladen, " + skipped + " übersprungen.";
-        const warningLimit = String(batchSettings.peakLimit).replace("-", "−");
-        const warning = peakWarnings ? " " + peakWarnings + " Datei(en) liegen weiterhin über " + warningLimit + " dBFS Spitzenpegel." : "";
-        showNotice("Batch abgeschlossen: " + uploaded + " hochgeladen, " + skipped + " übersprungen." + warning, peakWarnings ? "warning" : skipped ? "warning" : "success");
+        showNotice("Batch abgeschlossen: " + uploaded + " hochgeladen, " + skipped + " übersprungen.", skipped ? "warning" : "success");
       } finally {
         setBusy(false);
       }
