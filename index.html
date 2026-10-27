@@ -440,8 +440,25 @@
       return ffmpegPromise;
     }
 
+    function errorText(error) {
+      if (typeof error === "string" && error.trim()) return error;
+      if (error && typeof error.message === "string" && error.message.trim()) return error.message;
+      try {
+        const details = JSON.stringify(error);
+        if (details && details !== "{}") return details;
+      } catch (_) {}
+      return "Unbekannter Fehler beim Verarbeiten der Datei.";
+    }
+
     async function runFfmpeg(ffmpeg, args) {
-      const exitCode = await ffmpeg.exec(args);
+      let exitCode;
+      try {
+        exitCode = await ffmpeg.exec(args);
+      } catch (error) {
+        try { ffmpeg.terminate(); } catch (_) {}
+        ffmpegPromise = null;
+        throw new Error(errorText(error));
+      }
       if (exitCode !== 0) throw new Error("Die Audiodatei konnte nicht verarbeitet werden. Bitte ein unterstütztes Audioformat wählen.");
     }
 
@@ -568,6 +585,13 @@
           file: new File([bytes], outputName, { type: "audio/ogg; codecs=opus" }),
           metrics: metrics
         };
+      } catch (error) {
+        if (!(error instanceof Error)) {
+          try { ffmpeg.terminate(); } catch (_) {}
+          ffmpegPromise = null;
+          throw new Error(errorText(error));
+        }
+        throw error;
       } finally {
         try { await ffmpeg.deleteFile("input"); } catch (_) {}
         try { await ffmpeg.deleteFile("output.opus"); } catch (_) {}
@@ -1053,7 +1077,8 @@
               : selectedFiles.length === 1 ? selectedFiles[0].name : selectedFiles.length + " Dateien ausgewählt";
           } catch (error) {
             progressLabel.textContent = "Abgebrochen nach " + processed + " von " + batchTotal + " Dateien; diese und folgende bleiben ausgewählt.";
-            showNotice(sourceFile.name + ": " + error.message, "error");
+            console.error("Upload bei „" + sourceFile.name + "“ abgebrochen:", error);
+            showNotice(sourceFile.name + ": " + errorText(error), "error");
             return;
           }
         }
