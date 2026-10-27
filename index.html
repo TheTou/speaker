@@ -90,6 +90,8 @@
     .settings-fields.preset-fields { grid-template-columns: 1fr; }
     .settings-fields label { display: grid; align-content: start; gap: 5px; color: #344252; font-size: .9rem; }
     .settings-fields input, .settings-fields select { width: 100%; min-height: 40px; border: 1px solid #c7d0da; border-radius: 7px; padding: 8px; color: inherit; font: inherit; }
+    .settings-fields input[type="range"] { min-height: 24px; border: 0; padding: 0; }
+    .settings-fields output { color: #53657a; font-size: .88rem; }
     .settings-note { margin: 14px 0 !important; font-size: .88rem; }
     .settings-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
     @media (max-width: 560px) {
@@ -162,19 +164,23 @@
 
   <dialog id="encodingSettingsDialog" aria-labelledby="encodingSettingsTitle" aria-describedby="encodingSettingsDescription">
     <form id="encodingSettingsForm">
-      <h2 id="encodingSettingsTitle">Lautstärkeprofil</h2>
-      <p id="encodingSettingsDescription">Wähle, wie laut die konvertierten Clips wiedergegeben werden sollen. Tiefe Töne unter 150 Hz werden für den kleinen Lautsprecher reduziert; vorhandene .opus-Dateien bleiben unverändert.</p>
+      <h2 id="encodingSettingsTitle">Lautstärkeeinstellungen</h2>
+      <p id="encodingSettingsDescription">Das Lautstärkeprofil gilt für neu konvertierte Clips. Die Lautsprecher-Lautstärke wirkt auf alle Clips; tiefe Töne unter 150 Hz werden reduziert.</p>
       <div class="settings-fields preset-fields">
-        <label for="settingPreset">Wiedergabe-Lautstärke
+        <label for="settingPreset">Lautstärkeprofil für neue Dateien
           <select id="settingPreset">
             <option value="quiet">Leise</option>
             <option value="normal">Normal (empfohlen)</option>
             <option value="loud">Laut</option>
           </select>
         </label>
+        <label for="settingPlaybackVolume">Lautsprecher-Lautstärke
+          <input id="settingPlaybackVolume" type="range" min="0" max="100" step="1" value="20">
+          <output id="playbackVolumeOutput" for="settingPlaybackVolume">20 %</output>
+        </label>
       </div>
       <p id="presetDescription" class="settings-note" aria-live="polite">Ausgewogene Lautstärke für die meisten Clips.</p>
-      <p class="settings-note">Konvertierte Dateien werden auf Übersteuerung geprüft; unsichere Dateien werden nicht übertragen. Die Auswahl wird auf diesem ESP32 gespeichert.</p>
+      <p class="settings-note">Konvertierte Dateien werden auf Übersteuerung geprüft; unsichere Dateien werden nicht übertragen. Beide Einstellungen werden auf diesem ESP32 gespeichert.</p>
       <div class="settings-actions">
         <button id="cancelSettingsButton" class="secondary" type="button">Abbrechen</button>
         <button type="submit">Speichern</button>
@@ -207,6 +213,7 @@
       bitrate: 32,
       vbr: true
     });
+    const DEFAULT_PLAYBACK_VOLUME = 20;
     const connectButton = document.getElementById("connectButton");
     const refreshButton = document.getElementById("refreshButton");
     const uploadButton = document.getElementById("uploadButton");
@@ -247,6 +254,7 @@
     let previewUrl = null;
     let ffmpegPromise = null;
     let encodingSettings = Object.assign({}, DEFAULT_ENCODING_SETTINGS);
+    let playbackVolume = DEFAULT_PLAYBACK_VOLUME;
     let encodingSettingsLoaded = false;
 
     function showNotice(message, kind) {
@@ -291,6 +299,10 @@
         typeof settings.vbr === "boolean";
     }
 
+    function validPlaybackVolume(value) {
+      return Number.isInteger(value) && value >= 0 && value <= 100;
+    }
+
     function settingsForPreset(preset) {
       const selected = ENCODING_PRESETS[preset] ? preset : "normal";
       return Object.assign({}, DEFAULT_ENCODING_SETTINGS, {
@@ -315,10 +327,12 @@
       return Object.keys(DEFAULT_ENCODING_SETTINGS).every(function (key) { return settings[key] === expected[key]; });
     }
 
-    function populateSettingsForm(settings) {
+    function populateSettingsForm(settings, volume) {
       const preset = settings.preset || presetForSettings(settings);
       document.getElementById("settingPreset").value = preset;
       document.getElementById("presetDescription").textContent = ENCODING_PRESETS[preset].description;
+      document.getElementById("settingPlaybackVolume").value = volume;
+      document.getElementById("playbackVolumeOutput").textContent = volume + " %";
     }
 
     function readSettingsForm() {
@@ -746,10 +760,12 @@
         vbr: message.vbr
       };
       if (!validEncodingSettings(settings)) throw new Error("Der ESP32 hat ungültige Encoder-Einstellungen gespeichert.");
+      settings.playbackVolume = Number(message.playbackVolume);
+      if (!validPlaybackVolume(settings.playbackVolume)) throw new Error("Die Firmware unterstützt die Lautsprecher-Lautstärke noch nicht. Bitte die aktualisierte Firmware flashen.");
       return settings;
     }
 
-    function deviceSettingsCommand(settings) {
+    function deviceSettingsCommand(settings, volume) {
       return {
         cmd: "SET_SETTINGS",
         loudness10: Math.round(settings.loudness * 10),
@@ -761,7 +777,8 @@
         channels: settings.channels,
         application: settings.application,
         bitrate: settings.bitrate,
-        vbr: settings.vbr
+        vbr: settings.vbr,
+        playbackVolume: volume
       };
     }
 
@@ -1143,6 +1160,7 @@
           renderFiles(await listFiles());
           const storedSettings = await readDeviceEncodingSettings();
           encodingSettings = settingsFromDeviceSettings(storedSettings);
+          playbackVolume = storedSettings.playbackVolume;
           encodingSettingsLoaded = true;
           const presetLabel = ENCODING_PRESETS[encodingSettings.preset].label;
           const needsSave = !deviceSettingsMatchPreset(storedSettings, encodingSettings.preset);
@@ -1192,15 +1210,20 @@
     document.getElementById("settingPreset").addEventListener("change", function (event) {
       document.getElementById("presetDescription").textContent = ENCODING_PRESETS[event.target.value].description;
     });
+    document.getElementById("settingPlaybackVolume").addEventListener("input", function (event) {
+      document.getElementById("playbackVolumeOutput").textContent = event.target.value + " %";
+    });
     settingsButton.addEventListener("click", async function () {
       if (!port || busy) return;
       encodingSettingsLoaded = false;
       setBusy(true);
       showNotice("Einstellungen werden vom ESP32 geladen …");
       try {
-        encodingSettings = settingsFromDeviceSettings(await readDeviceEncodingSettings());
+        const storedSettings = await readDeviceEncodingSettings();
+        encodingSettings = settingsFromDeviceSettings(storedSettings);
+        playbackVolume = storedSettings.playbackVolume;
         encodingSettingsLoaded = true;
-        populateSettingsForm(encodingSettings);
+        populateSettingsForm(encodingSettings, playbackVolume);
         settingsDialog.showModal();
         showNotice("");
       } catch (error) {
@@ -1213,8 +1236,13 @@
     settingsForm.addEventListener("submit", async function (event) {
       event.preventDefault();
       const settings = readSettingsForm();
+      const selectedPlaybackVolume = Number(document.getElementById("settingPlaybackVolume").value);
       if (!validEncodingSettings(settings)) {
         showNotice("Dieses Lautstärkeprofil ist ungültig.", "error");
+        return;
+      }
+      if (!validPlaybackVolume(selectedPlaybackVolume)) {
+        showNotice("Die Lautsprecher-Lautstärke ist ungültig.", "error");
         return;
       }
       if (!port || busy) {
@@ -1224,11 +1252,12 @@
       setBusy(true);
       showNotice("Einstellungen werden auf dem ESP32 gespeichert …");
       try {
-        await sendCommand(deviceSettingsCommand(settings));
+        await sendCommand(deviceSettingsCommand(settings, selectedPlaybackVolume));
         const result = await nextMessage();
         if (result.type === "error") throw new Error(explainError(result.code));
         if (result.type !== "ok" || result.cmd !== "SET_SETTINGS") throw new Error("Der ESP32 hat das Speichern nicht bestätigt.");
         encodingSettings = settings;
+        playbackVolume = selectedPlaybackVolume;
         encodingSettingsLoaded = true;
         settingsDialog.close();
         showNotice("Einstellungen dauerhaft auf dem ESP32 gespeichert.", "success");
