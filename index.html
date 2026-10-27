@@ -482,6 +482,8 @@
         "aformat=channel_layouts=" + (settings.channels === 1 ? "mono" : "stereo"),
         "highpass=f=150:p=2",
         "acompressor=threshold=0.126:ratio=" + settings.compressionRatio + ":attack=10:release=150:makeup=1",
+        // EBU R128 needs a complete 400 ms block; this only extends shorter clips.
+        "apad=whole_dur=0.4",
         "loudnorm=I=" + targetLoudness + ":TP=" + truePeak + ":LRA=" + settings.lra
       ];
       if (inputStats) {
