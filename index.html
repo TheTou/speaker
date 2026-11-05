@@ -142,6 +142,7 @@
       <div id="progressLabel" aria-live="polite"></div>
 
       <div class="file-tools">
+        <button id="downloadSelectedButton" type="button" disabled>Alle herunterladen</button>
         <button id="deleteSelectedButton" class="danger" type="button" disabled>Auswahl löschen (0)</button>
         <span id="selectionCount" class="file-name">0 Clips ausgewählt</span>
       </div>
@@ -223,6 +224,7 @@
     const cancelSettingsButton = document.getElementById("cancelSettingsButton");
     const fileInput = document.getElementById("fileInput");
     const fileName = document.getElementById("fileName");
+    const downloadSelectedButton = document.getElementById("downloadSelectedButton");
     const deleteSelectedButton = document.getElementById("deleteSelectedButton");
     const selectionCount = document.getElementById("selectionCount");
     const selectAllFiles = document.getElementById("selectAllFiles");
@@ -346,6 +348,10 @@
       selectAllFiles.checked = checkboxes.length > 0 && checked === checkboxes.length;
       selectAllFiles.indeterminate = checked > 0 && checked < checkboxes.length;
       selectAllFiles.disabled = !port || busy || checkboxes.length === 0;
+      downloadSelectedButton.disabled = !port || busy || listedFiles.length === 0;
+      downloadSelectedButton.textContent = selectedOpusNames.size
+        ? "Auswahl herunterladen (" + selectedOpusNames.size + ")"
+        : "Alle herunterladen";
       deleteSelectedButton.disabled = !port || busy || selectedOpusNames.size === 0;
       deleteSelectedButton.textContent = "Auswahl löschen (" + selectedOpusNames.size + ")";
       selectionCount.textContent = selectedOpusNames.size + (selectedOpusNames.size === 1 ? " Clip ausgewählt" : " Clips ausgewählt");
@@ -800,18 +806,18 @@
       }
     }
 
-    async function downloadFile(file) {
+    async function downloadFile(file, label) {
       await sendCommand({ cmd: "DOWNLOAD", name: file.name });
       const ready = await nextMessage();
       if (ready.type === "error") throw new Error(explainError(ready.code));
-      if (ready.type !== "downloadReady") throw new Error("Der ESP32 hat die Vorschau nicht gestartet.");
+      if (ready.type !== "downloadReady") throw new Error("Der ESP32 hat den Download nicht gestartet.");
 
       const size = Number(ready.size);
       const chunkSize = Number(ready.chunkSize);
       if (!Number.isSafeInteger(size) || size < 1 || size !== file.size ||
           !Number.isInteger(chunkSize) || chunkSize < 1 || chunkSize > 4096) {
         try { await cancelDownload(); } catch (_) {}
-        throw new Error("Die Dateigröße oder Blockgröße der Vorschau ist ungültig.");
+        throw new Error("Die Dateigröße oder Blockgröße des Downloads ist ungültig.");
       }
 
       const chunks = [];
@@ -822,22 +828,22 @@
           const message = await nextMessage(12000);
           if (message.type === "error") throw new Error(explainError(message.code));
           if (message.type !== "data" || Number(message.offset) !== received || typeof message.data !== "string") {
-            throw new Error("Ungültiger Datenblock bei der Vorschau.");
+            throw new Error("Ungültiger Datenblock beim Download.");
           }
           const chunk = decodeBase64(message.data);
           if (!chunk.length || chunk.length > chunkSize || chunk.length > size - received) {
-            throw new Error("Ungültige Datenlänge bei der Vorschau.");
+            throw new Error("Ungültige Datenlänge beim Download.");
           }
           chunks.push(chunk);
           received += chunk.length;
           progress.value = Math.round((received / size) * 100);
-          progressLabel.textContent = "Vorschau gelesen: " + formatSize(received) + " von " + formatSize(size);
+          progressLabel.textContent = (label || "Vorschau") + ": " + formatSize(received) + " von " + formatSize(size);
         }
 
         const finished = await nextMessage();
         if (finished.type === "error") throw new Error(explainError(finished.code));
         if (finished.type !== "downloadDone" || Number(finished.size) !== size) {
-          throw new Error("Der ESP32 hat die Vorschau nicht vollständig bestätigt.");
+          throw new Error("Der ESP32 hat den Download nicht vollständig bestätigt.");
         }
       } catch (error) {
         try { await cancelDownload(); } catch (_) {}
@@ -845,6 +851,39 @@
       }
 
       return new Blob(chunks, { type: "audio/ogg; codecs=opus" });
+    }
+
+    async function downloadSelectedFiles() {
+      if (!port || busy || listedFiles.length === 0) return;
+      const files = selectedOpusNames.size
+        ? listedFiles.filter(function (file) { return selectedOpusNames.has(file.name); })
+        : listedFiles.slice();
+      setBusy(true);
+      progress.hidden = false;
+      let downloaded = 0;
+      try {
+        for (let i = 0; i < files.length; ++i) {
+          const file = files[i];
+          progress.value = 0;
+          const label = "Download " + (i + 1) + "/" + files.length + " – " + file.name;
+          showNotice("Lade " + file.name + " (" + (i + 1) + "/" + files.length + ") vom ESP32 …");
+          const blob = await downloadFile(file, label);
+          const url = URL.createObjectURL(blob);
+          const link = document.createElement("a");
+          link.href = url;
+          link.download = file.name;
+          link.click();
+          window.setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+          ++downloaded;
+        }
+        showNotice("Übertragung abgeschlossen: " + downloaded + " Clip(s) zum Download bereit. Falls der Browser fragt, Mehrfachdownloads erlauben.", "success");
+      } catch (error) {
+        showNotice("Herunterladen nach " + downloaded + " von " + files.length + " Clip(s) abgebrochen: " + error.message, "error");
+      } finally {
+        progress.hidden = true;
+        progressLabel.textContent = "";
+        setBusy(false);
+      }
     }
 
     async function previewFile(file) {
@@ -1267,6 +1306,7 @@
         setBusy(false);
       }
     });
+    downloadSelectedButton.addEventListener("click", downloadSelectedFiles);
     deleteSelectedButton.addEventListener("click", deleteSelectedFiles);
     sortNameButton.addEventListener("click", function () { changeSort("name"); });
     sortSizeButton.addEventListener("click", function () { changeSort("size"); });
