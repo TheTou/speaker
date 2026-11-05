@@ -851,6 +851,10 @@
       return oldPort;
     }
 
+    function isExpectedFirmwareChip(chip) {
+      return /^ESP32-C6(?: \(revision (?:v)?\d+(?:\.\d+)*\))?$/.test(chip);
+    }
+
     async function updateFirmware() {
       if (!firmwareUpdateAvailable || !latestFirmwareManifest || busy) return;
       setBusy(true);
@@ -882,7 +886,7 @@
         transport = new esptool.Transport(selectedPort, true);
         loader = new esptool.ESPLoader({ transport: transport, baudrate: 115200, romBaudrate: 115200, debugLogging: false });
         detectedChip = await loader.main(firmwareRetryInBootloader ? "no_reset" : "usb_reset");
-        if (detectedChip !== "ESP32-C6") throw new Error("Falscher Chip erkannt: " + detectedChip + ". Erwartet wird ESP32-C6.");
+        if (!isExpectedFirmwareChip(detectedChip)) throw new Error("Falscher Chip erkannt: " + detectedChip + ". Erwartet wird ESP32-C6.");
         bootloaderReady = true;
 
         await loader.writeFlash({
@@ -910,7 +914,7 @@
           : "Firmware v" + latestFirmwareManifest.version + " wurde geschrieben. Verbinde das Board erneut, um die Version zu prüfen.", resetFailed ? "warning" : "success");
       } catch (error) {
         if (connectionClosed && !flashWritten) {
-          if (detectedChip && detectedChip !== "ESP32-C6") {
+          if (detectedChip && !isExpectedFirmwareChip(detectedChip)) {
             firmwareRetryInBootloader = false;
             firmwareUpdateButton.textContent = "Firmware aktualisieren";
             firmwareStatus.textContent = "Falscher Chip erkannt · erwartet wird ESP32-C6.";
