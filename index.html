@@ -44,6 +44,7 @@
     button.danger { background: #fff0ef; color: #b42318; padding: 7px 10px; }
     button.danger:hover:not(:disabled) { background: #ffddda; }
     #status { margin-left: auto; color: #536170; font-size: .92rem; }
+    #firmwareStatus { color: #536170; font-size: .92rem; }
     #notice { min-height: 24px; margin: 12px 0; color: #536170; }
     #notice.error { color: #b42318; }
     #notice.success { color: #087443; }
@@ -120,6 +121,8 @@
       <div class="toolbar">
         <button id="connectButton" type="button">USB verbinden</button>
         <button id="refreshButton" class="secondary" type="button" disabled>Liste aktualisieren</button>
+        <button id="firmwareUpdateButton" type="button" hidden>Firmware aktualisieren</button>
+        <span id="firmwareStatus" role="status" aria-live="polite"></span>
         <span id="status" role="status">Nicht verbunden</span>
       </div>
 
@@ -195,6 +198,9 @@
     const CHUNK_FALLBACK = 512;
     const FFMPEG_VERSION = "0.12.10";
     const FFMPEG_CDN = "https://cdn.jsdelivr.net/npm";
+    const ESPTOOL_JS_URL = "https://unpkg.com/esptool-js@0.7.0/bundle.js";
+    const APP_FLASH_ADDRESS = 0x10000;
+    const APP_PARTITION_SIZE = 0x78000;
     const LOUDNESS_TOLERANCE = 0.5;
     const MAX_LOUDNESS_CORRECTIONS = 3;
     const ENCODING_PRESETS = Object.freeze({
@@ -217,6 +223,8 @@
     const DEFAULT_PLAYBACK_VOLUME = 20;
     const connectButton = document.getElementById("connectButton");
     const refreshButton = document.getElementById("refreshButton");
+    const firmwareUpdateButton = document.getElementById("firmwareUpdateButton");
+    const firmwareStatus = document.getElementById("firmwareStatus");
     const uploadButton = document.getElementById("uploadButton");
     const settingsButton = document.getElementById("settingsButton");
     const settingsDialog = document.getElementById("encodingSettingsDialog");
@@ -248,6 +256,10 @@
     let busy = false;
     let messages = [];
     let waiters = [];
+    let pendingPingResponses = 0;
+    let latestFirmwareManifest = null;
+    let firmwareUpdateAvailable = false;
+    let firmwareRetryInBootloader = false;
     let selectedFiles = [];
     let selectedOpusNames = new Set();
     let listedFiles = [];
@@ -276,6 +288,7 @@
         filesystemUsageLabel.textContent = "Nicht verbunden";
       }
       refreshButton.disabled = !port || busy;
+      firmwareUpdateButton.disabled = busy || !firmwareUpdateAvailable;
       uploadButton.disabled = !port || busy || selectedFiles.length === 0 || (!encodingSettingsLoaded && needsEncodingSettings(selectedFiles));
       settingsButton.disabled = !port || busy;
       for (const control of settingsForm.elements) control.disabled = busy;
@@ -661,11 +674,18 @@
         waiter.reject(error);
       }
       messages = [];
+      pendingPingResponses = 0;
     }
 
     function deliver(message) {
-      // Older firmware answers PING with unknown_command instead of PONG.
-      if (message.type === "pong" || (message.type === "error" && message.code === "unknown_command")) return;
+      if (message.type === "pong") {
+        if (pendingPingResponses > 0) pendingPingResponses--;
+        return;
+      }
+      if (message.type === "error" && message.code === "unknown_command" && pendingPingResponses > 0) {
+        pendingPingResponses--;
+        return;
+      }
       const waiter = waiters.shift();
       if (waiter) {
         clearTimeout(waiter.timer);
@@ -728,7 +748,198 @@
 
     async function sendCommand(command) {
       if (!writer) throw new Error("Keine USB-Verbindung.");
-      await writer.write(new TextEncoder().encode(JSON.stringify(command) + "\n"));
+      if (command.cmd === "PING") pendingPingResponses++;
+      try {
+        await writer.write(new TextEncoder().encode(JSON.stringify(command) + "\n"));
+      } catch (error) {
+        if (command.cmd === "PING" && pendingPingResponses > 0) pendingPingResponses--;
+        throw error;
+      }
+    }
+
+    async function fetchFirmwareAsset(url, timeoutMs) {
+      const controller = new AbortController();
+      const timer = setTimeout(function () { controller.abort(); }, timeoutMs);
+      try { return await fetch(url, { cache: "no-store", signal: controller.signal }); }
+      finally { clearTimeout(timer); }
+    }
+
+    async function loadLatestFirmwareManifest(versionTools) {
+      const response = await fetchFirmwareAsset(new URL("firmware.json", document.baseURI), 8000);
+      if (!response.ok) throw new Error("Versionsmeldung nicht erreichbar (HTTP " + response.status + ").");
+      return versionTools.validateFirmwareManifest(await response.json());
+    }
+
+    async function checkFirmwareUpdate() {
+      latestFirmwareManifest = null;
+      firmwareUpdateAvailable = false;
+      firmwareRetryInBootloader = false;
+      firmwareUpdateButton.hidden = true;
+      firmwareUpdateButton.textContent = "Firmware aktualisieren";
+      firmwareStatus.textContent = "Firmware-Version wird geprüft …";
+      try {
+        const versionTools = await import(new URL("firmware-version.mjs", document.baseURI).href);
+        const manifest = await loadLatestFirmwareManifest(versionTools);
+        latestFirmwareManifest = manifest;
+        await sendCommand({ cmd: "GET_FIRMWARE_VERSION" });
+        const response = await nextMessage();
+        let installedVersion = null;
+        if (response.type === "firmwareVersion") {
+          try {
+            versionTools.parseFirmwareVersion(response.version);
+            installedVersion = response.version;
+          } catch (_) {
+            // Firmware without a usable version is treated like a pre-versioned release.
+          }
+        } else if (response.type !== "error" || response.code !== "unknown_command") {
+          throw new Error(response.type === "error" ? explainError(response.code) : "Ungültige Versionsantwort vom ESP32.");
+        }
+
+        const comparison = installedVersion === null ? 1 : versionTools.compareFirmwareVersions(manifest.version, installedVersion);
+        firmwareUpdateAvailable = comparison > 0;
+        firmwareUpdateButton.hidden = !firmwareUpdateAvailable;
+        if (firmwareUpdateAvailable) {
+          firmwareUpdateButton.textContent = "Firmware v" + manifest.version + " aktualisieren";
+          firmwareStatus.textContent = installedVersion === null
+            ? "Installierte Version unbekannt · Update v" + manifest.version + " verfügbar"
+            : "Installiert v" + installedVersion + " · Update v" + manifest.version + " verfügbar";
+        } else if (comparison === 0) {
+          firmwareStatus.textContent = "Firmware aktuell: v" + manifest.version;
+        } else {
+          firmwareStatus.textContent = "Installiert v" + installedVersion + " · neuer als Website-Version v" + manifest.version;
+        }
+      } catch (error) {
+        latestFirmwareManifest = null;
+        firmwareUpdateAvailable = false;
+        firmwareUpdateButton.hidden = true;
+        firmwareStatus.textContent = "Version nicht prüfbar: " + error.message;
+      }
+    }
+
+    async function loadFirmwareImage(manifest) {
+      const response = await fetchFirmwareAsset(new URL(manifest.firmware, document.baseURI), 30000);
+      if (!response.ok) throw new Error("Firmware-Image nicht erreichbar (HTTP " + response.status + ").");
+      const image = new Uint8Array(await response.arrayBuffer());
+      if (image.length === 0 || image.length > APP_PARTITION_SIZE) throw new Error("Das Firmware-Image passt nicht in den App-Bereich.");
+      if (!globalThis.crypto || !globalThis.crypto.subtle) throw new Error("SHA-256-Prüfung ist in diesem Browser nicht verfügbar.");
+      const digest = await globalThis.crypto.subtle.digest("SHA-256", image);
+      const checksum = Array.from(new Uint8Array(digest), function (byte) { return byte.toString(16).padStart(2, "0"); }).join("");
+      if (checksum !== manifest.sha256) throw new Error("Die SHA-256-Prüfung des Firmware-Images ist fehlgeschlagen.");
+      return image;
+    }
+
+    async function closeSerialConnection() {
+      const oldPort = port;
+      const oldReader = reader;
+      const oldWriter = writer;
+      port = null;
+      reader = null;
+      writer = null;
+      encodingSettingsLoaded = false;
+      rejectWaiters(new Error("USB-Verbindung wird für das Firmware-Update geschlossen."));
+      if (oldReader) {
+        try { await oldReader.cancel(); } catch (_) {}
+        try { oldReader.releaseLock(); } catch (_) {}
+      }
+      if (oldWriter) {
+        try { await oldWriter.close(); } catch (_) {}
+        try { oldWriter.releaseLock(); } catch (_) {}
+      }
+      if (oldPort) {
+        try { await oldPort.close(); } catch (_) {}
+      }
+      return oldPort;
+    }
+
+    async function updateFirmware() {
+      if (!firmwareUpdateAvailable || !latestFirmwareManifest || busy) return;
+      setBusy(true);
+      showNotice("Firmware-Image und Flash-Tool werden geladen …");
+      progress.hidden = false;
+      progress.removeAttribute("value");
+      progressLabel.textContent = "Firmware-Image wird geprüft …";
+      let selectedPort = port;
+      let transport = null;
+      let loader = null;
+      let connectionClosed = false;
+      let bootloaderReady = false;
+      let detectedChip = null;
+      let flashWritten = false;
+      try {
+        if (!selectedPort) selectedPort = await navigator.serial.requestPort();
+        const [esptool, image] = await Promise.all([
+          import(ESPTOOL_JS_URL),
+          loadFirmwareImage(latestFirmwareManifest)
+        ]);
+        await closeSerialConnection();
+        connectionClosed = true;
+        status.textContent = "Firmware-Update";
+        showNotice("Verbinde mit dem ROM-Downloadmodus des ESP32-C6 …");
+        progress.hidden = false;
+        progress.value = 0;
+        progressLabel.textContent = "Firmware v" + latestFirmwareManifest.version + " wird vorbereitet …";
+
+        transport = new esptool.Transport(selectedPort, true);
+        loader = new esptool.ESPLoader({ transport: transport, baudrate: 115200, romBaudrate: 115200, debugLogging: false });
+        detectedChip = await loader.main(firmwareRetryInBootloader ? "no_reset" : "usb_reset");
+        if (detectedChip !== "ESP32-C6") throw new Error("Falscher Chip erkannt: " + detectedChip + ". Erwartet wird ESP32-C6.");
+        bootloaderReady = true;
+
+        await loader.writeFlash({
+          fileArray: [{ data: image, address: APP_FLASH_ADDRESS }],
+          flashMode: "keep",
+          flashFreq: "keep",
+          flashSize: "detect",
+          eraseAll: false,
+          compress: true,
+          reportProgress: function (_, written, total) {
+            progress.value = total > 0 ? Math.round((written / total) * 100) : 0;
+            progressLabel.textContent = "Firmware v" + latestFirmwareManifest.version + " wird geschrieben: " + progress.value + " %";
+          }
+        });
+        flashWritten = true;
+        progress.value = 100;
+        firmwareUpdateAvailable = false;
+        firmwareRetryInBootloader = false;
+        firmwareUpdateButton.hidden = true;
+        firmwareStatus.textContent = "Firmware v" + latestFirmwareManifest.version + " geschrieben · bitte neu verbinden";
+        let resetFailed = false;
+        try { await loader.after("hard_reset"); } catch (_) { resetFailed = true; }
+        showNotice(resetFailed
+          ? "Firmware wurde geschrieben. Drücke bei Bedarf RESET und verbinde das Board erneut."
+          : "Firmware v" + latestFirmwareManifest.version + " wurde geschrieben. Verbinde das Board erneut, um die Version zu prüfen.", resetFailed ? "warning" : "success");
+      } catch (error) {
+        if (connectionClosed && !flashWritten) {
+          if (detectedChip && detectedChip !== "ESP32-C6") {
+            firmwareRetryInBootloader = false;
+            firmwareUpdateButton.textContent = "Firmware aktualisieren";
+            firmwareStatus.textContent = "Falscher Chip erkannt · erwartet wird ESP32-C6.";
+            showNotice(error.message, "error");
+          } else if (bootloaderReady) {
+            firmwareRetryInBootloader = true;
+            firmwareUpdateButton.textContent = "Im Bootloader erneut versuchen";
+            firmwareStatus.textContent = "Flash fehlgeschlagen · erneut im Downloadmodus versuchen.";
+            showNotice("Das Firmware-Image konnte nicht vollständig geschrieben werden. Versuche es erneut; falls das Board den Downloadmodus verlassen hat, halte BOOT, drücke kurz RESET und lasse BOOT los. " + error.message, "warning");
+          } else {
+            firmwareRetryInBootloader = true;
+            firmwareUpdateButton.textContent = "Bootloader auswählen und erneut versuchen";
+            firmwareStatus.textContent = "Downloadmodus nicht erreicht · BOOT/RESET erforderlich.";
+            showNotice("Der automatische Downloadmodus ist fehlgeschlagen. Halte BOOT, drücke kurz RESET, lasse BOOT los und klicke danach erneut auf den Update-Button. " + error.message, "warning");
+          }
+        } else {
+          showNotice(error.name === "NotFoundError" ? "Geräteauswahl abgebrochen." : error.message, "error");
+        }
+      } finally {
+        if (transport) {
+          try { await transport.disconnect(); } catch (_) {}
+        }
+        progress.hidden = true;
+        if (connectionClosed) {
+          status.textContent = "Nicht verbunden";
+          connectButton.textContent = "USB verbinden";
+        }
+        setBusy(false);
+      }
     }
 
     async function listFiles() {
@@ -1194,8 +1405,9 @@
         connectButton.textContent = "Port trennen";
         void readResponses(reader, port, writer);
         setBusy(true);
-        showNotice("Verbunden. Dateiliste und Einstellungen werden geladen …");
+        showNotice("Verbunden. Firmware-Version, Dateiliste und Einstellungen werden geladen …");
         try {
+          await checkFirmwareUpdate();
           renderFiles(await listFiles());
           const storedSettings = await readDeviceEncodingSettings();
           encodingSettings = settingsFromDeviceSettings(storedSettings);
@@ -1217,25 +1429,7 @@
     }
 
     async function disconnect() {
-      const oldPort = port;
-      const oldReader = reader;
-      const oldWriter = writer;
-      port = null;
-      reader = null;
-      writer = null;
-      encodingSettingsLoaded = false;
-      rejectWaiters(new Error("Port getrennt."));
-      if (oldReader) {
-        try { await oldReader.cancel(); } catch (_) {}
-        try { oldReader.releaseLock(); } catch (_) {}
-      }
-      if (oldWriter) {
-        try { await oldWriter.close(); } catch (_) {}
-        try { oldWriter.releaseLock(); } catch (_) {}
-      }
-      if (oldPort) {
-        try { await oldPort.close(); } catch (_) {}
-      }
+      await closeSerialConnection();
       status.textContent = "Nicht verbunden";
       connectButton.textContent = "USB verbinden";
       refreshButton.disabled = true;
@@ -1245,6 +1439,7 @@
 
     connectButton.addEventListener("click", connect);
     refreshButton.addEventListener("click", refreshFiles);
+    firmwareUpdateButton.addEventListener("click", updateFirmware);
     uploadButton.addEventListener("click", uploadFile);
     document.getElementById("settingPreset").addEventListener("change", function (event) {
       document.getElementById("presetDescription").textContent = ENCODING_PRESETS[event.target.value].description;
