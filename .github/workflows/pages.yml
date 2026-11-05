@@ -26,7 +26,7 @@ jobs:
       - name: Package page only
         run: |
           mkdir -p _site
-          cp index.html _site/index.html
+          cp index.html firmware-version.mjs firmware.json firmware.bin _site/
       - uses: actions/upload-pages-artifact@v4
         with:
           path: _site
