@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="page-version" content="6900aa1d32da608ab228f75c7d7eebb3db0a5116d284d6bccda3a157845af9f8">
+  <meta name="page-version" content="89b98f4dc019578a663ef6ed344a90fcd78326e5a5a9d31aa6d260b0c313ad8e">
   <title>Soundclips verwalten</title>
   <style>
     :root {
@@ -769,12 +769,15 @@
       }
     }
 
-    async function fetchFirmwareAsset(url, timeoutMs) {
+    async function fetchFirmwareAsset(url, timeoutMs, bodyType) {
       const controller = new AbortController();
       const timer = setTimeout(function () { controller.abort(); }, timeoutMs);
       const freshURL = new URL(url, document.baseURI);
       freshURL.searchParams.set("_fresh", crypto.randomUUID());
-      try { return await fetch(freshURL, { cache: "no-store", signal: controller.signal }); }
+      try {
+        const response = await fetch(freshURL, { cache: "no-store", signal: controller.signal });
+        return { ok: response.ok, status: response.status, body: response.ok ? await response[bodyType]() : null };
+      }
       finally { clearTimeout(timer); }
     }
 
@@ -786,9 +789,9 @@
       const previousNotice = { message: notice.textContent, kind: notice.className };
       showNotice("Website-Version wird geprüft …");
       try {
-        const response = await fetchFirmwareAsset(new URL("page-version.json", document.baseURI), 8000);
+        const response = await fetchFirmwareAsset(new URL("page-version.json", document.baseURI), 8000, "json");
         if (!response.ok) throw new Error("HTTP " + response.status);
-        const latest = await response.json();
+        const latest = response.body;
         if (!latest || !/^[a-f0-9]{64}$/.test(latest.version)) throw new Error("Ungültige Versionsmeldung.");
         if (latest.version !== PAGE_VERSION) {
           const next = new URL(location.href);
@@ -808,9 +811,9 @@
     }
 
     async function loadLatestFirmwareManifest(versionTools) {
-      const response = await fetchFirmwareAsset(new URL("firmware.json", document.baseURI), 8000);
+      const response = await fetchFirmwareAsset(new URL("firmware.json", document.baseURI), 8000, "json");
       if (!response.ok) throw new Error("Versionsmeldung nicht erreichbar (HTTP " + response.status + ").");
-      return versionTools.validateFirmwareManifest(await response.json());
+      return versionTools.validateFirmwareManifest(response.body);
     }
 
     async function checkFirmwareUpdate() {
@@ -862,9 +865,9 @@
     }
 
     async function loadFirmwareImage(manifest) {
-      const response = await fetchFirmwareAsset(new URL(manifest.firmware, document.baseURI), 30000);
+      const response = await fetchFirmwareAsset(new URL(manifest.firmware, document.baseURI), 30000, "arrayBuffer");
       if (!response.ok) throw new Error("Firmware-Image nicht erreichbar (HTTP " + response.status + ").");
-      const image = new Uint8Array(await response.arrayBuffer());
+      const image = new Uint8Array(response.body);
       if (image.length === 0 || image.length > APP_PARTITION_SIZE) throw new Error("Das Firmware-Image passt nicht in den App-Bereich.");
       if (!globalThis.crypto || !globalThis.crypto.subtle) throw new Error("SHA-256-Prüfung ist in diesem Browser nicht verfügbar.");
       const digest = await globalThis.crypto.subtle.digest("SHA-256", image);
@@ -1289,6 +1292,10 @@
       }
     }
 
+    function validClipName(name) {
+      return new TextEncoder().encode(name).length <= 128 && !/[\x00-\x1f\x7f/\\]/.test(name);
+    }
+
     async function renameFile(file) {
       if (!port || busy) return;
       const input = window.prompt("Neuer Dateiname (.opus bleibt erhalten):", file.name);
@@ -1299,7 +1306,7 @@
         return;
       }
       if (!newName.toLowerCase().endsWith(".opus")) newName += ".opus";
-      if (new TextEncoder().encode(newName).length > 128 || /[\x00-\x1f\x7f/\\]/.test(newName)) {
+      if (!validClipName(newName)) {
         showNotice("Dateiname ungültig: maximal 128 UTF-8-Bytes, keine Pfade oder Steuerzeichen.", "error");
         return;
       }
@@ -1384,17 +1391,18 @@
       }
     }
 
-    async function uploadOneFile(sourceFile, batchIndex, batchTotal, settings) {
+    async function uploadOneFile(sourceFile, batchIndex, batchTotal, settings, files) {
       const isOpus = sourceFile.name.toLowerCase().endsWith(".opus");
       const uploadName = isOpus ? sourceFile.name : opusFileName(sourceFile.name);
+      if (!validClipName(uploadName)) {
+        throw new Error("Dateiname ungültig: maximal 128 UTF-8-Bytes, keine Pfade oder Steuerzeichen.");
+      }
       if (sourceFile.size === 0) {
         throw new Error("Leere Dateien können nicht hochgeladen werden.");
       }
 
       const label = "(" + batchIndex + "/" + batchTotal + ") " + sourceFile.name;
       progress.value = 0;
-      progressLabel.textContent = label + ": Prüfe vorhandene Dateien …";
-      const files = await listFiles();
       const existing = files.find(function (entry) { return entry.name === uploadName; });
       const replace = Boolean(existing);
       if (replace && !window.confirm("„" + uploadName + "“ ist bereits vorhanden. Nach vollständigem Upload ersetzen?")) {
@@ -1445,7 +1453,8 @@
       const finished = await nextMessage();
       if (finished.type === "error") throw new Error(explainError(finished.code));
       if (finished.type !== "done") throw new Error("Der ESP32 hat den Upload nicht bestätigt.");
-      renderFiles(await listFiles());
+      if (existing) existing.size = uploadFile.size;
+      else files.push({ name: uploadName, size: uploadFile.size });
       return { skipped: false };
     }
 
@@ -1455,16 +1464,19 @@
       let uploaded = 0;
       let skipped = 0;
       let processed = 0;
+      let batchFailed = false;
+      let files = null;
       const batchSettings = Object.assign({}, encodingSettings);
       setBusy(true);
       progress.hidden = false;
       showNotice("");
       try {
+        files = await listFiles();
         while (selectedFiles.length) {
           const sourceFile = selectedFiles[0];
           const batchIndex = processed + 1;
           try {
-            const result = await uploadOneFile(sourceFile, batchIndex, batchTotal, batchSettings);
+            const result = await uploadOneFile(sourceFile, batchIndex, batchTotal, batchSettings, files);
             selectedFiles.shift();
             processed++;
             if (result.skipped) skipped++;
@@ -1473,6 +1485,7 @@
               ? "Keine Datei ausgewählt"
               : selectedFiles.length === 1 ? selectedFiles[0].name : selectedFiles.length + " Dateien ausgewählt";
           } catch (error) {
+            batchFailed = true;
             progressLabel.textContent = "Abgebrochen nach " + processed + " von " + batchTotal + " Dateien; diese und folgende bleiben ausgewählt.";
             console.error("Upload bei „" + sourceFile.name + "“ abgebrochen:", error);
             showNotice(sourceFile.name + ": " + errorText(error), "error");
@@ -1484,7 +1497,14 @@
         progress.value = 100;
         progressLabel.textContent = "Fertig: " + uploaded + " hochgeladen, " + skipped + " übersprungen.";
         showNotice("Batch abgeschlossen: " + uploaded + " hochgeladen, " + skipped + " übersprungen.", skipped ? "warning" : "success");
+      } catch (error) {
+        batchFailed = true;
+        showNotice(errorText(error), "error");
       } finally {
+        if (port && !batchFailed) {
+          try { renderFiles(await listFiles()); }
+          catch (error) { showNotice("Dateiliste konnte nicht aktualisiert werden: " + errorText(error), "warning"); }
+        } else if (port && files) renderFiles(files);
         setBusy(false);
       }
     }
@@ -1568,7 +1588,7 @@
           decoder_start: "Decoder konnte nicht gestartet werden", output_start: "I2S konnte nicht gestartet werden",
           no_progress: "Zwei Sekunden ohne Audio-Ausgabe", drain_timeout: "Zeitlimit beim Leeren des Audiopuffers",
           watchdog_setup: "Watchdog konnte nicht aktiviert werden", watchdog_reset: "Watchdog hat den ESP32 neu gestartet",
-          unexpected_reset: "Unerwarteter Neustart während der Wiedergabe"
+          unexpected_reset: "Unerwarteter Neustart während der Wiedergabe", invalid_packet: "Opus-Paket ist größer als 1024 Bytes"
         };
         const phases = { mount: "Dateisystem", select: "Clip-Auswahl", open: "Clip öffnen", start: "Decoderstart",
           play: "Wiedergabe", drain: "Puffer leeren", stop: "I2S abschalten", close: "Dateien schließen" };
