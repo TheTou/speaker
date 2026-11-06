@@ -74,6 +74,12 @@
     th:last-child, td:last-child { width: 190px; text-align: right; }
     input.file-select { width: 18px; height: 18px; margin: 0; accent-color: #155eef; vertical-align: middle; }
     .file-actions { display: flex; justify-content: flex-end; gap: 8px; }
+    .clip-title { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; }
+    .clip-title span { overflow-wrap: anywhere; min-width: 0; }
+    button.rename { opacity: 0; pointer-events: none; flex-shrink: 0; padding: 4px 6px; background: transparent; color: #536170; font-size: 1.15rem; }
+    #fileRows tr:hover button.rename, #fileRows tr:focus-within button.rename, button.rename:focus-visible { opacity: 1; pointer-events: auto; }
+    button.rename:hover:not(:disabled) { background: #e9eef4; color: #155eef; }
+    @media (hover: none) { button.rename { opacity: 1; pointer-events: auto; } }
     button.preview { background: #e9eef4; color: #263545; padding: 7px 10px; }
     button.preview:hover:not(:disabled) { background: #dce5ee; }
     .empty { color: #657282; text-align: center !important; padding: 24px 8px; }
@@ -654,6 +660,7 @@
         invalid_name: "Der Dateiname oder die Dateiendung ist ungültig.",
         not_found: "Diese Datei wurde auf dem ESP32 nicht gefunden.",
         delete_failed: "Die Datei konnte nicht gelöscht werden.",
+        rename_failed: "Die Datei konnte nicht umbenannt werden. Der bisherige Clip bleibt erhalten.",
         exists: "Eine Datei mit diesem Namen ist bereits vorhanden.",
         no_space: "Im LittleFS ist nicht genug freier Speicher für den Upload.",
         empty_file: "Leere Dateien können nicht hochgeladen werden.",
@@ -1176,6 +1183,9 @@
         const actions = document.createElement("div");
         const previewButton = document.createElement("button");
         const deleteButton = document.createElement("button");
+        const renameButton = document.createElement("button");
+        const title = document.createElement("span");
+        const nameLabel = document.createElement("span");
         const checkbox = document.createElement("input");
         checkbox.type = "checkbox";
         checkbox.className = "file-select";
@@ -1191,12 +1201,22 @@
         selectCell.appendChild(checkbox);
         const fileNameCharacters = Array.from(file.name);
         const truncated = fileNameCharacters.length > 30;
-        nameCell.textContent = truncated ? fileNameCharacters.slice(0, 29).join("") + "…" : file.name;
-        if (Array.from(nameCell.textContent).length > 30) throw new Error("Dateiname überschreitet die Anzeigelänge.");
+        nameLabel.textContent = truncated ? fileNameCharacters.slice(0, 29).join("") + "…" : file.name;
+        if (Array.from(nameLabel.textContent).length > 30) throw new Error("Dateiname überschreitet die Anzeigelänge.");
         if (truncated) {
-          nameCell.title = file.name;
-          nameCell.setAttribute("aria-label", file.name);
+          nameLabel.title = file.name;
+          nameLabel.setAttribute("aria-label", file.name);
         }
+        title.className = "clip-title";
+        renameButton.type = "button";
+        renameButton.className = "rename";
+        renameButton.textContent = "✏️";
+        renameButton.title = "Datei umbenennen";
+        renameButton.setAttribute("aria-label", "Clip " + file.name + " umbenennen");
+        renameButton.disabled = !port || busy;
+        renameButton.addEventListener("click", function () { renameFile(file); });
+        title.append(nameLabel, renameButton);
+        nameCell.appendChild(title);
         sizeCell.textContent = formatSize(file.size);
         actions.className = "file-actions";
         previewButton.type = "button";
@@ -1227,6 +1247,50 @@
         const files = await listFiles();
         renderFiles(files);
         showNotice(files.length + " Clip(s) gefunden.", "success");
+      } catch (error) {
+        showNotice(error.message, "error");
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    async function renameFile(file) {
+      if (!port || busy) return;
+      const input = window.prompt("Neuer Dateiname (.opus bleibt erhalten):", file.name);
+      if (input === null) return;
+      let newName = input.trim();
+      if (!newName) {
+        showNotice("Bitte einen Dateinamen eingeben.", "error");
+        return;
+      }
+      if (!newName.toLowerCase().endsWith(".opus")) newName += ".opus";
+      if (new TextEncoder().encode(newName).length > 128 || /[\x00-\x1f\x7f/\\]/.test(newName)) {
+        showNotice("Dateiname ungültig: maximal 128 UTF-8-Bytes, keine Pfade oder Steuerzeichen.", "error");
+        return;
+      }
+      if (newName === file.name) return;
+      if (listedFiles.some(function (entry) { return entry.name === newName; })) {
+        showNotice("Eine Datei mit diesem Namen ist bereits vorhanden.", "error");
+        return;
+      }
+      setBusy(true);
+      showNotice("Datei wird umbenannt …");
+      try {
+        await sendCommand({ cmd: "RENAME", name: file.name, newName: newName });
+        const result = await nextMessage();
+        if (result.type === "error") throw new Error(result.code === "unknown_command"
+          ? "Das Umbenennen benötigt Firmware 1.0.4 oder neuer." : explainError(result.code));
+        if (result.type !== "ok" || result.cmd !== "RENAME") throw new Error("Unerwartete Antwort vom ESP32.");
+        if (selectedOpusNames.delete(file.name)) selectedOpusNames.add(newName);
+        if (previewLabel.textContent === file.name) previewLabel.textContent = newName;
+        renderFiles(listedFiles.map(function (entry) { return entry.name === file.name ? Object.assign({}, entry, { name: newName }) : entry; }));
+        try {
+          renderFiles(await listFiles());
+        } catch (error) {
+          showNotice("Datei umbenannt. Liste konnte nicht erneut geladen werden: " + error.message, "warning");
+          return;
+        }
+        showNotice("Datei umbenannt in „" + newName + "“.", "success");
       } catch (error) {
         showNotice(error.message, "error");
       } finally {
