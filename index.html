@@ -121,6 +121,7 @@
       <div class="toolbar">
         <button id="connectButton" type="button">USB verbinden</button>
         <button id="refreshButton" class="secondary" type="button" disabled>Liste aktualisieren</button>
+        <button id="diagnosticsButton" class="secondary" type="button" disabled>Wiedergabe-Diagnose</button>
         <button id="firmwareUpdateButton" type="button" hidden>Firmware aktualisieren</button>
         <span id="firmwareStatus" role="status" aria-live="polite"></span>
         <span id="status" role="status">Nicht verbunden</span>
@@ -223,6 +224,7 @@
     const DEFAULT_PLAYBACK_VOLUME = 20;
     const connectButton = document.getElementById("connectButton");
     const refreshButton = document.getElementById("refreshButton");
+    const diagnosticsButton = document.getElementById("diagnosticsButton");
     const firmwareUpdateButton = document.getElementById("firmwareUpdateButton");
     const firmwareStatus = document.getElementById("firmwareStatus");
     const uploadButton = document.getElementById("uploadButton");
@@ -288,6 +290,7 @@
         filesystemUsageLabel.textContent = "Nicht verbunden";
       }
       refreshButton.disabled = !port || busy;
+      diagnosticsButton.disabled = !port || busy;
       firmwareUpdateButton.disabled = busy || !firmwareUpdateAvailable;
       uploadButton.disabled = !port || busy || selectedFiles.length === 0 || (!encodingSettingsLoaded && needsEncodingSettings(selectedFiles));
       settingsButton.disabled = !port || busy;
@@ -1443,6 +1446,42 @@
 
     connectButton.addEventListener("click", connect);
     refreshButton.addEventListener("click", refreshFiles);
+    diagnosticsButton.addEventListener("click", async function () {
+      if (!port || busy) return;
+      setBusy(true);
+      try {
+        await sendCommand({ cmd: "GET_PLAYBACK_DIAGNOSTICS" });
+        const result = await nextMessage();
+        if (result.type === "error") throw new Error(result.code === "unknown_command"
+          ? "Die Wiedergabe-Diagnose benötigt Firmware 1.0.3 oder neuer." : explainError(result.code));
+        if (result.type !== "playbackDiagnostics" || typeof result.hasFault !== "boolean" || typeof result.pirHigh !== "boolean") {
+          throw new Error("Ungültige Wiedergabe-Diagnose vom ESP32.");
+        }
+        const signal = " Aktuelles PIR-Signal: " + (result.pirHigh ? "HIGH (Bewegung)" : "LOW (Ruhe)") + ".";
+        if (!result.hasFault) {
+          showNotice("Kein Wiedergabefehler gespeichert." + signal, "success");
+          return;
+        }
+        if (![result.reason, result.phase, result.file, result.firmware].every(function (value) { return typeof value === "string"; }) ||
+            !Number.isInteger(result.resetReason) || result.resetReason < 0) throw new Error("Ungültiger Wiedergabefehler vom ESP32.");
+        const reasons = {
+          filesystem: "Dateisystem konnte nicht geöffnet werden", open: "Clip konnte nicht geöffnet werden",
+          decoder_start: "Decoder konnte nicht gestartet werden", output_start: "I2S konnte nicht gestartet werden",
+          no_progress: "Zwei Sekunden ohne Audio-Ausgabe", drain_timeout: "Zeitlimit beim Leeren des Audiopuffers",
+          watchdog_setup: "Watchdog konnte nicht aktiviert werden", watchdog_reset: "Watchdog hat den ESP32 neu gestartet",
+          unexpected_reset: "Unerwarteter Neustart während der Wiedergabe"
+        };
+        const phases = { mount: "Dateisystem", select: "Clip-Auswahl", open: "Clip öffnen", start: "Decoderstart",
+          play: "Wiedergabe", drain: "Puffer leeren", stop: "I2S abschalten", close: "Dateien schließen" };
+        showNotice("Letzter gespeicherter Fehler: " + (reasons[result.reason] || result.reason) +
+          ". Phase: " + (phases[result.phase] || result.phase) + ". Clip: " + (result.file || "–") +
+          ". Firmware: " + result.firmware + ". Boot-Reset-Code: " + result.resetReason + "." + signal, "warning");
+      } catch (error) {
+        showNotice(error.message, "error");
+      } finally {
+        setBusy(false);
+      }
+    });
     firmwareUpdateButton.addEventListener("click", updateFirmware);
     uploadButton.addEventListener("click", uploadFile);
     document.getElementById("settingPreset").addEventListener("change", function (event) {
