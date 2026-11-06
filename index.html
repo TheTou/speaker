@@ -3,6 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="page-version" content="6900aa1d32da608ab228f75c7d7eebb3db0a5116d284d6bccda3a157845af9f8">
   <title>Soundclips verwalten</title>
   <style>
     :root {
@@ -202,6 +203,7 @@
   <script>
     "use strict";
 
+    const PAGE_VERSION = document.querySelector('meta[name="page-version"]').content;
     const CHUNK_FALLBACK = 512;
     const FFMPEG_VERSION = "0.12.10";
     const FFMPEG_CDN = "https://cdn.jsdelivr.net/npm";
@@ -770,8 +772,39 @@
     async function fetchFirmwareAsset(url, timeoutMs) {
       const controller = new AbortController();
       const timer = setTimeout(function () { controller.abort(); }, timeoutMs);
-      try { return await fetch(url, { cache: "no-store", signal: controller.signal }); }
+      const freshURL = new URL(url, document.baseURI);
+      freshURL.searchParams.set("_fresh", crypto.randomUUID());
+      try { return await fetch(freshURL, { cache: "no-store", signal: controller.signal }); }
       finally { clearTimeout(timer); }
+    }
+
+    async function checkPageVersion() {
+      // The unstamped source remains usable as a local, offline HTML file.
+      if (!/^[a-f0-9]{64}$/.test(PAGE_VERSION) || location.protocol === "file:") return;
+      const main = document.querySelector("main");
+      main.inert = true;
+      const previousNotice = { message: notice.textContent, kind: notice.className };
+      showNotice("Website-Version wird geprüft …");
+      try {
+        const response = await fetchFirmwareAsset(new URL("page-version.json", document.baseURI), 8000);
+        if (!response.ok) throw new Error("HTTP " + response.status);
+        const latest = await response.json();
+        if (!latest || !/^[a-f0-9]{64}$/.test(latest.version)) throw new Error("Ungültige Versionsmeldung.");
+        if (latest.version !== PAGE_VERSION) {
+          const next = new URL(location.href);
+          if (next.searchParams.get("page-version") === latest.version) {
+            throw new Error("Die neue Veröffentlichung ist noch nicht vollständig verfügbar.");
+          }
+          next.searchParams.set("page-version", latest.version);
+          next.searchParams.set("_fresh", crypto.randomUUID());
+          location.replace(next.href);
+          return;
+        }
+        main.inert = false;
+        showNotice(previousNotice.message, previousNotice.kind);
+      } catch (error) {
+        showNotice("Website-Version nicht prüfbar: " + error.message + " Bitte die Seite erneut laden.", "error");
+      }
     }
 
     async function loadLatestFirmwareManifest(versionTools) {
@@ -788,7 +821,9 @@
       firmwareUpdateButton.textContent = "Firmware aktualisieren";
       firmwareStatus.textContent = "Firmware-Version wird geprüft …";
       try {
-        const versionTools = await import(new URL("firmware-version.mjs", document.baseURI).href);
+        const versionToolsURL = new URL("firmware-version.mjs", document.baseURI);
+        versionToolsURL.searchParams.set("v", PAGE_VERSION);
+        const versionTools = await import(versionToolsURL.href);
         const manifest = await loadLatestFirmwareManifest(versionTools);
         latestFirmwareManifest = manifest;
         await sendCommand({ cmd: "GET_FIRMWARE_VERSION" });
@@ -1632,6 +1667,9 @@
     window.addEventListener("pagehide", function () {
       if (ffmpegPromise) void ffmpegPromise.then(function (ffmpeg) { ffmpeg.terminate(); }, function () {});
     });
+    window.addEventListener("pageshow", function (event) {
+      if (event.persisted) void checkPageVersion();
+    });
 
     if (navigator.serial) {
       navigator.serial.addEventListener("disconnect", function (event) {
@@ -1641,6 +1679,7 @@
       connectButton.disabled = true;
       showNotice("Web Serial fehlt. Bitte Chrome oder Edge auf dem Desktop verwenden.", "error");
     }
+    void checkPageVersion();
   </script>
 </body>
 </html>
